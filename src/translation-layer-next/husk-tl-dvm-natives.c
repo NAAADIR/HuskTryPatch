@@ -17,6 +17,7 @@
 
 #include "husk-tl-bionic.h"
 #include "husk-tl-internal.h"
+#include "husk-tl-string-range.h"
 #include <strings.h>
 
 static jvalue J(int64_t v) { jvalue r; r.j = v; return r; }
@@ -114,7 +115,8 @@ NAT(String_fastSubstring)
 {
     int32_t n; const uint16_t *s = chars(self, &n);
     int32_t start = a[0].i, len = a[1].i;
-    if (start < 0 || len < 0 || start + len > n) return dvm_throw("java/lang/StringIndexOutOfBoundsException", "substring");
+    if (!tl_string_range_valid(n, start, len)) return dvm_throw("java/lang/StringIndexOutOfBoundsException", "substring start=%d length=%d stringLength=%d", start, len, n);
+    if (!s) return dvm_throw("java/lang/IllegalStateException", "substring receiver has no UTF-16 storage");
     *ret = L(tl_dvm_string_u16(s + start, len));
     return true;
 }

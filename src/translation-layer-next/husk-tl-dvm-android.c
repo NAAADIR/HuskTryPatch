@@ -29,6 +29,7 @@
 #include "husk-tl-ld.h"
 #include "husk-tl-docs.h"
 #include "husk-tl-perm.h"
+#include "husk-tl-web-rect.h"
 
 void tl_nwindow_configure(int w, int h, void *layer);
 void *tl_nwindow_get(void);
@@ -592,6 +593,7 @@ dvm_native_fn tl_sqlite_native(const char *name, const char *sig);
 dvm_native_fn tl_media_native(const char *name, const char *sig);
 dvm_native_fn tl_web_native(const char *name, const char *sig);
 bool tl_web_any_visible(void);
+int tl_web_visible_rects(int rects[][4], int cap);
 dvm_native_fn dvm_android_native(const char *cls, const char *name, const char *sig)
 {
     if (!strcmp(cls, "husk/Sqlite")) return tl_sqlite_native(name, sig);
@@ -725,6 +727,38 @@ static void ov_draw(overlay *o, int vw, int vh)
     attrPtr(0, 2, 0x1406, 0, 0, NULL);
     enableAttr(0);
     draw(0x0005, 0, 4);
+}
+
+/* WebKit is below the Metal view. A transparent WebView in the Android UI
+ * texture does not erase the game behind it under source-over blending. */
+static int web_clear_holes(int vw, int vh)
+{
+    int rects[16][4], n = tl_web_visible_rects(rects, 16), count = 0;
+    if (!n) return 0;
+    void (*getInt)(uint32_t, int32_t *) = gl_fn("glGetIntegerv");
+    void (*getFloat)(uint32_t, float *) = gl_fn("glGetFloatv");
+    void (*getBool)(uint32_t, uint8_t *) = gl_fn("glGetBooleanv");
+    uint8_t (*isEnabled)(uint32_t) = gl_fn("glIsEnabled");
+    void (*enable)(uint32_t) = gl_fn("glEnable"), (*disable)(uint32_t) = gl_fn("glDisable");
+    void (*scissor)(int32_t, int32_t, int32_t, int32_t) = gl_fn("glScissor");
+    void (*mask)(uint8_t, uint8_t, uint8_t, uint8_t) = gl_fn("glColorMask");
+    void (*color)(float, float, float, float) = gl_fn("glClearColor");
+    void (*clear)(uint32_t) = gl_fn("glClear");
+    if (!getInt || !getFloat || !getBool || !isEnabled || !enable || !disable || !scissor || !mask || !color || !clear) return 0;
+    int32_t old[4]; float old_color[4]; uint8_t old_mask[4];
+    getInt(0x0C10, old); getFloat(0x0C22, old_color); getBool(0x0C23, old_mask);
+    bool was_scissor = isEnabled(0x0C11) != 0;
+    enable(0x0C11); mask(1, 1, 1, 1); color(0, 0, 0, 0);
+    for (int i = 0; i < n; i++) {
+        int box[4];
+        if (!tl_web_scissor(rects[i][0], rects[i][1], rects[i][2], rects[i][3], vw, vh, box)) continue;
+        scissor(box[0], box[1], box[2], box[3]); clear(0x4000); count++;
+    }
+    scissor(old[0], old[1], old[2], old[3]);
+    if (!was_scissor) disable(0x0C11);
+    mask(old_mask[0], old_mask[1], old_mask[2], old_mask[3]);
+    color(old_color[0], old_color[1], old_color[2], old_color[3]);
+    return count;
 }
 
 /* ---- EGL for the app's own threads (a GLSurfaceView copied into the app, an engine's GL thread, EGL14 users)
@@ -1086,8 +1120,25 @@ static void *gl_main(void *arg)
             makeCurrent(dpy, surf, surf, ui);
             if (!app) { clearColor(0, 0, 0, tl_web_any_visible() && !app_frame_on() ? 0 : 1); clear(0x4000); }     /* web views show through from under the screen */
             if (!app) app_frame_draw(&appov, &appup, A.cfg.width, A.cfg.height);
+            unsigned long frame = atomic_load(&A.frames) + 1;
+            if ((frame == 1 || frame == 120 || frame == 600 || frame % 1800 == 0) && A.cfg.width > 0 && A.cfg.height > 0) {
+                void (*readPixels)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void *) = gl_fn("glReadPixels");
+                uint8_t px[4] = {0};
+                if (readPixels) readPixels(A.cfg.width / 2, A.cfg.height / 2, 1, 1, 0x1908, 0x1401, px);
+                tl_log_line("javaapp: frame=%lu game center rgba=%u,%u,%u,%u", frame, px[0], px[1], px[2], px[3]);
+            }
+            int holes = web_clear_holes(A.cfg.width, A.cfg.height);
             if (tl_ui_has_frame()) ov_draw(&ov, A.cfg.width, A.cfg.height);
-            swapBuffers(dpy, surf);
+            if (frame == 1 || frame == 120 || frame == 600 || frame % 1800 == 0) {
+                void (*readPixels)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void *) = gl_fn("glReadPixels");
+                int32_t fb = -1, viewport[4] = {0}; uint8_t px[4] = {0};
+                void (*getInt)(uint32_t, int32_t *) = gl_fn("glGetIntegerv");
+                if (getInt) { getInt(0x8CA6, &fb); getInt(0x0BA2, viewport); }
+                if (readPixels && A.cfg.width > 0 && A.cfg.height > 0) readPixels(A.cfg.width / 2, A.cfg.height / 2, 1, 1, 0x1908, 0x1401, px);
+                tl_log_line("javaapp: frame=%lu composed center rgba=%u,%u,%u,%u fb=%d viewport=%d,%d,%d,%d webholes=%d app=%d ui=%d", frame, px[0], px[1], px[2], px[3], fb, viewport[0], viewport[1], viewport[2], viewport[3], holes, app != NULL, tl_ui_has_frame());
+            }
+            unsigned swapped = swapBuffers(dpy, surf);
+            if (!swapped && (frame <= 3 || frame % 600 == 0)) tl_log_line("javaapp: EGL window swap failed at frame %lu", frame);
             atomic_fetch_add(&A.frames, 1);
         }
         next += 1000000000ll / 60;

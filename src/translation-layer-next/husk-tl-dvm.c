@@ -251,15 +251,17 @@ static uint16_t *utf8_to_u16(const char *s, int32_t *n)
 const uint16_t *tl_dvm_string_chars(jobj *s, int32_t *n)
 {
     if (!s || s->kind != TL_K_STRING) { *n = 0; return NULL; }
-    if (!s->str.u16) {
+    uint16_t *chars = __atomic_load_n(&s->str.u16, __ATOMIC_ACQUIRE);
+    if (!chars) {
         int32_t len; uint16_t *u = utf8_to_u16(s->str.utf8 ? s->str.utf8 : "", &len);
         pthread_mutex_lock(&g_lock);
-        if (!s->str.u16) { s->str.u16 = u; s->str.len16 = len; u = NULL; }
+        chars = __atomic_load_n(&s->str.u16, __ATOMIC_RELAXED);
+        if (!chars) { s->str.len16 = len; chars = u; __atomic_store_n(&s->str.u16, u, __ATOMIC_RELEASE); u = NULL; }
         pthread_mutex_unlock(&g_lock);
         free(u);
     }
     *n = s->str.len16;
-    return s->str.u16;
+    return chars;
 }
 
 static tl_jclass *g_string_class;

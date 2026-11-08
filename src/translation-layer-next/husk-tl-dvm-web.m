@@ -65,7 +65,7 @@ static __weak HView *g_screen;    /* the app's GL view */
 static HView *g_container;
 static float g_scale = 1;         /* surface pixels per point */
 static pthread_mutex_t g_hit_lock = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { int id; bool visible, touchable; float x, y, w, h; } hit_rect;   /* points */
+typedef struct { int id; bool visible, touchable; float x, y, w, h; int px, py, pw, ph; } hit_rect;   /* points and pixels */
 static hit_rect g_hits[16];
 static int g_nhits;
 
@@ -320,13 +320,14 @@ static NSString *bridge_js(void)
     emit(@"o", _wid, @[ [NSString stringWithFormat:@"%d", call], u.absoluteString ?: @"", main ? @"1" : @"0",
                         act.navigationType == WKNavigationTypeLinkActivated ? @"1" : @"0", act.request.HTTPMethod ?: @"GET", web ? @"1" : @"0" ]);
 }
-- (void)webView:(WKWebView *)w didStartProvisionalNavigation:(WKNavigation *)n { emit(@"s", _wid, @[ w.URL.absoluteString ?: @"" ]); }
-- (void)webView:(WKWebView *)w didCommitNavigation:(WKNavigation *)n { emit(@"m", _wid, @[ w.URL.absoluteString ?: @"" ]); [self history]; }
-- (void)webView:(WKWebView *)w didFinishNavigation:(WKNavigation *)n { [self history]; emit(@"f", _wid, @[ w.URL.absoluteString ?: @"" ]); }
+- (void)webView:(WKWebView *)w didStartProvisionalNavigation:(WKNavigation *)n { tl_log_line("web: id=%d navigation started", _wid); emit(@"s", _wid, @[ w.URL.absoluteString ?: @"" ]); }
+- (void)webView:(WKWebView *)w didCommitNavigation:(WKNavigation *)n { tl_log_line("web: id=%d navigation committed", _wid); emit(@"m", _wid, @[ w.URL.absoluteString ?: @"" ]); [self history]; }
+- (void)webView:(WKWebView *)w didFinishNavigation:(WKNavigation *)n { tl_log_line("web: id=%d navigation finished", _wid); [self history]; emit(@"f", _wid, @[ w.URL.absoluteString ?: @"" ]); }
 - (void)failed:(NSError *)e
 {
     if ([e.domain isEqualToString:NSURLErrorDomain] && e.code == NSURLErrorCancelled) return;
     if ([e.domain isEqualToString:@"WebKitErrorDomain"] && e.code == 102) return;      /* frame load interrupted by a policy change */
+    tl_log_line("web: id=%d navigation failed domain=%s code=%ld", _wid, e.domain.UTF8String, (long)e.code);
     NSString *url = [e.userInfo[NSURLErrorFailingURLStringErrorKey] description] ?: _web.URL.absoluteString ?: @"";
     emit(@"E", _wid, @[ [NSString stringWithFormat:@"%ld", (long)e.code], e.localizedDescription ?: @"", url ]);
 }
@@ -394,13 +395,13 @@ static void on_main(dispatch_block_t b) { dispatch_async(dispatch_get_main_queue
 static void dispatch_sync_main_safe(dispatch_block_t b) { if ([NSThread isMainThread]) b(); else dispatch_async(dispatch_get_main_queue(), b); }
 static HuskWeb *view_of(int wid) { return g_views[@(wid)]; }
 
-static void update_hits(int wid, bool visible, bool touchable, CGRect r)
+static void update_hits(int wid, bool visible, bool touchable, CGRect r, int x, int y, int w, int h)
 {
     pthread_mutex_lock(&g_hit_lock);
     int i = 0;
     while (i < g_nhits && g_hits[i].id != wid) i++;
     if (i == g_nhits && g_nhits < 16) g_nhits++;
-    if (i < 16) g_hits[i] = (hit_rect){ wid, visible, touchable, (float)r.origin.x, (float)r.origin.y, (float)r.size.width, (float)r.size.height };
+    if (i < 16) g_hits[i] = (hit_rect){ wid, visible, touchable, (float)r.origin.x, (float)r.origin.y, (float)r.size.width, (float)r.size.height, x, y, w, h };
     int n = 0;
     for (int k = 0; k < g_nhits; k++) if (g_hits[k].visible) n++;
     pthread_mutex_unlock(&g_hit_lock);
@@ -445,7 +446,7 @@ NAT(W_frame)
     int wid = a[0].i;
     bool vis = a[5].i != 0, touchable = a[6].i != 0;
     CGRect r = CGRectMake(a[1].i / g_scale, a[2].i / g_scale, a[3].i / g_scale, a[4].i / g_scale);
-    update_hits(wid, vis, touchable, r);
+    update_hits(wid, vis, touchable, r, a[1].i, a[2].i, a[3].i, a[4].i);
     on_main(^{
         HuskWeb *h = view_of(wid);
         if (!h) return;
@@ -465,6 +466,7 @@ NAT(W_frame)
         h.web.frame = r;
         h.web.hidden = !vis;
         set_screen_opaque(atomic_load(&g_visible_webs) == 0);
+        tl_log_line("web: id=%d frame=(%.1f,%.1f %.1fx%.1f) visible=%d touchable=%d attached=%d screenOpaque=%d", wid, r.origin.x, r.origin.y, r.size.width, r.size.height, vis, touchable, h.web.window != nil, g_screen.layer.opaque);
     });
     return true;
 }
@@ -802,6 +804,19 @@ bool tl_web_hit(float x, float y)
 }
 
 bool tl_web_any_visible(void) { return atomic_load(&g_visible_webs) > 0; }
+
+/* Snapshot in Android pixels, independently of the point coordinates used for touch. */
+int tl_web_visible_rects(int rects[][4], int cap)
+{
+    int n = 0;
+    pthread_mutex_lock(&g_hit_lock);
+    for (int i = 0; i < g_nhits && n < cap; i++) if (g_hits[i].visible) {
+        rects[n][0] = g_hits[i].px; rects[n][1] = g_hits[i].py;
+        rects[n][2] = g_hits[i].pw; rects[n][3] = g_hits[i].ph; n++;
+    }
+    pthread_mutex_unlock(&g_hit_lock);
+    return n;
+}
 
 #if !TARGET_OS_IPHONE
 /* The harness: a run loop on the main thread for WebKit, taps as clicks, and the web views' pixels for screenshots. */

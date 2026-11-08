@@ -383,6 +383,7 @@ public final class AppRunner {
     }
     private static void hostPause(boolean pause) {
         if (pause == sPausedByHost) return;
+        android.util.Log.d("Husk", "host lifecycle " + (pause ? "pause" : "resume") + " top=" + (top() != null ? top().getClass().getName() : "none"));
         sPausedByHost = pause;
         Activity a = top();
         if (a == null) return;

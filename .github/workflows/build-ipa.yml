@@ -96,6 +96,11 @@ jobs:
             shasum -a 256 "$RUNNER_TEMP/ipa-$dex"
             echo "$dex matches the framework built from $GITHUB_SHA"
           done
+          unzip -p build/Husk.ipa Payload/Husk.app/Husk > "$RUNNER_TEMP/ipa-Husk"
+          test -s "$RUNNER_TEMP/ipa-Husk"
+          strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'composed center rgba=' > /dev/null
+          shasum -a 256 "$RUNNER_TEMP/ipa-Husk"
+          echo "IPA executable contains the Java compositor diagnostic from $GITHUB_SHA"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
