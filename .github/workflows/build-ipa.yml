@@ -73,7 +73,13 @@ jobs:
         run: |
           curl -fsSL -o "$RUNNER_TEMP/r8.jar" https://dl.google.com/android/maven2/com/android/tools/r8/8.5.35/r8-8.5.35.jar
           HUSK_JDK="$JAVA_HOME" HUSK_D8="$RUNNER_TEMP/r8.jar" ./src/java-framework/build.sh "$PWD/build/java-runtime/husk-framework.dex"
-          ls -la build/java-runtime/husk-framework.dex
+          mkdir -p "$RUNNER_TEMP/fresh-framework"
+          for dex in husk-framework.dex husk-framework-core.dex; do
+            test -s "build/java-runtime/$dex"
+            cp "build/java-runtime/$dex" "$RUNNER_TEMP/fresh-framework/$dex"
+            shasum -a 256 "$RUNNER_TEMP/fresh-framework/$dex"
+          done
+          echo "Framework source commit: $(git rev-parse HEAD)"
 
       - name: Build
         run: ./scripts/ci_build.sh "$PWD/build/Husk.ipa"
@@ -83,6 +89,13 @@ jobs:
           n=$(unzip -l build/Husk.ipa | grep -c "Payload/Husk.app/java-runtime/") || true
           echo "java-runtime files in the IPA: $n"
           test "$n" -gt 10
+          for dex in husk-framework.dex husk-framework-core.dex; do
+            unzip -p build/Husk.ipa "Payload/Husk.app/java-runtime/$dex" > "$RUNNER_TEMP/ipa-$dex"
+            test -s "$RUNNER_TEMP/ipa-$dex"
+            cmp "$RUNNER_TEMP/fresh-framework/$dex" "$RUNNER_TEMP/ipa-$dex"
+            shasum -a 256 "$RUNNER_TEMP/ipa-$dex"
+            echo "$dex matches the framework built from $GITHUB_SHA"
+          done
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4

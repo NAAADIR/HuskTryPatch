@@ -77,15 +77,20 @@ public final class GmsCore {
 
     private static void refuse(IBinder callback) {
         Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
         try {
             data.writeInterfaceToken(CALLBACKS);
             data.writeInt(API_UNAVAILABLE);
             data.writeStrongBinder(null);
             data.writeInt(0);                                    // no Bundle
-            callback.transact(ON_POST_INIT_COMPLETE, data, null, IBinder.FLAG_ONEWAY);
+            if (callback.transact(ON_POST_INIT_COMPLETE, data, reply, 0)) reply.readException();
         } catch (RemoteException e) {
             android.util.Log.w("HuskGms", "the app's callback failed", e);
-        } finally { data.recycle(); }
+        } catch (RuntimeException e) {
+            android.util.Log.w("HuskGms", "callback transaction failed: type=" + callback.getClass().getName()
+                    + ", code=" + ON_POST_INIT_COMPLETE + ", flags=0", e);
+            throw e;
+        } finally { reply.recycle(); data.recycle(); }
     }
 
     /** IAdvertisingIdService, which ad and analytics libraries ask directly. */
