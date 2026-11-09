@@ -232,6 +232,8 @@ bool tl_ld_add_apk(const char *path)
     return true;
 }
 
+static void bf_diag_reset(void);
+
 void tl_ld_reset_session(void)
 {
     pthread_mutex_lock(&g_big);
@@ -247,6 +249,7 @@ void tl_ld_reset_session(void)
         else { L->name[0] = 0; L->soname[0] = 0; }
     }
     G.nlibs = keep;
+    bf_diag_reset();   /* Old guest function pointers cannot be reused by another APK. */
     pthread_mutex_unlock(&g_big);
     tl_a32_reset();
     tl_log_line("ld: the app's libraries are forgotten; another APK can load");
@@ -1809,6 +1812,123 @@ static uint64_t bind_symbol(tl_lib *L, uint32_t symidx, bool *failed)
     return val;
 }
 
+/* BF v20 authentication diagnostic. These wrappers only replace relocation slots;
+ * they never write guest instructions or inspect notice text, identifiers or packets. */
+static _Atomic(uintptr_t) bf_force_fn, bf_guest_fn, bf_shutdown_fn, bf_notice_fn, bf_parse_fn;
+
+/* Do not retain pointers into the previous guest image across a session reset. */
+static void bf_diag_reset(void)
+{
+    atomic_store_explicit(&bf_force_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_guest_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_shutdown_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_notice_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_parse_fn, 0, memory_order_release);
+}
+
+/* This establishes which GOT/PLT slots were intercepted, NOT that a
+ * particular game control flow subsequently reached those slots. */
+static void bf_diag_hook_report(const tl_lib *L)
+{
+    if (strcmp(L->soname, "libgame.so") || L->build || L->arm32) return;
+    tl_log_line("BF-AUTH-DIAG hook_summary force=%d parse=%d guest=%d shutdown=%d notice=%d (slots_only)",
+                atomic_load_explicit(&bf_force_fn, memory_order_acquire) != 0,
+                atomic_load_explicit(&bf_parse_fn, memory_order_acquire) != 0,
+                atomic_load_explicit(&bf_guest_fn, memory_order_acquire) != 0,
+                atomic_load_explicit(&bf_shutdown_fn, memory_order_acquire) != 0,
+                atomic_load_explicit(&bf_notice_fn, memory_order_acquire) != 0);
+}
+
+/* The C++ mangled symbol does not encode parseResponse's return type.
+ * Preserve the native x0 return bits instead of coercing an unknown integer
+ * or pointer return into a C bool. */
+__attribute__((noinline)) static uintptr_t bf_diag_parse(void *self, void *response)
+{
+    uintptr_t (*original)(void *, void *) = (void *)atomic_load_explicit(&bf_parse_fn, memory_order_acquire);
+    const void *caller = __builtin_return_address(0);
+    uintptr_t result = original(self, response);
+    int saved = errno;
+    tl_lib *lib = tl_ld_lib_of(caller);
+    uintptr_t base = (uintptr_t)tl_ld_lib_base(lib);
+    uintptr_t offset = base ? (uintptr_t)caller - base : 0;
+    const char *callback = offset == 0x1c78ee0 ? "complete" : offset == 0x1c78f14 ? "error" : "other";
+    /* This function also parses wallet/player responses; its return is not a DLS-specific verdict. */
+    tl_log_line("BF-AUTH-DIAG service_parse callback=%s return_nonzero=%d", callback, result != 0);
+    errno = saved;
+    return result;
+}
+
+static bool bf_diag_force(void *self)
+{
+    bool (*original)(void *) = (void *)atomic_load_explicit(&bf_force_fn, memory_order_acquire);
+    bool result = original(self);
+    int saved = errno;
+    tl_log_line("BF-AUTH-DIAG force_flag equals_one=%d", result ? 1 : 0);
+    errno = saved;
+    return result;
+}
+
+static void bf_diag_guest(void *self, void *object)
+{
+    void (*original)(void *, void *) = (void *)atomic_load_explicit(&bf_guest_fn, memory_order_acquire);
+    int saved = errno;
+    tl_log_line("BF-AUTH-DIAG guest_login_success callback=entered");
+    errno = saved;
+    original(self, object);
+}
+
+static void bf_diag_shutdown(void *self, void *object)
+{
+    void (*original)(void *, void *) = (void *)atomic_load_explicit(&bf_shutdown_fn, memory_order_acquire);
+    int saved = errno;
+    tl_log_line("BF-AUTH-DIAG shutdown_callback entered=1");
+    errno = saved;
+    original(self, object);
+}
+
+__attribute__((noinline)) static void bf_diag_notice(void *self, int kind, const void *message, bool flag, int value)
+{
+    void (*original)(void *, int, const void *, bool, int) = (void *)atomic_load_explicit(&bf_notice_fn, memory_order_acquire);
+    int saved = errno;
+    const void *caller = __builtin_return_address(0);
+    tl_lib *lib = tl_ld_lib_of(caller);
+    uintptr_t base = (uintptr_t)tl_ld_lib_base(lib);
+    uintptr_t offset = base ? (uintptr_t)caller - base : 0;
+    const char *libname = lib ? tl_ld_lib_name(lib) : NULL;
+    const char *origin = !libname || !strstr(libname, "libgame.so") ? "unknown" :
+                         offset == 0x1b85104 ? "shutdown" : "other";
+    tl_log_line("BF-AUTH-DIAG notice origin=%s caller_offset=%#llx", origin,
+                (unsigned long long)offset);
+    errno = saved;
+    original(self, kind, message, flag, value);
+}
+
+static uint64_t bf_diag_relocation(tl_lib *L, const elf_sym *s, const char *name, uint32_t type, uint64_t original)
+{
+    if (!original || original == 1 || L->build || L->arm32 || strcmp(L->soname, "libgame.so")) return original;
+    struct entry { const char *name; uint64_t va; uint32_t type; _Atomic(uintptr_t) *slot; void *wrapper; const char *label; };
+    static const struct entry entries[] = {
+        { "_ZN21ServiceRequestManager18getForceUpdateFlagEv", 0x1c7b0d8, R_JUMP_SLOT, &bf_force_fn, (void *)bf_diag_force, "force" },
+        { "_ZN21ServiceRequestManager13parseResponseEPv", 0x1c795a4, R_JUMP_SLOT, &bf_parse_fn, (void *)bf_diag_parse, "service_parse" },
+        { "_ZN10TitleScene25onGumiLiveLoginSuccessfulEPN7cocos2d8CCObjectE", 0x1b8741c, R_GLOB_DAT, &bf_guest_fn, (void *)bf_diag_guest, "guest" },
+        { "_ZN10TitleScene27gameShutdownCallbackHandlerEPN7cocos2d8CCObjectE", 0x1b850c0, R_GLOB_DAT, &bf_shutdown_fn, (void *)bf_diag_shutdown, "shutdown" },
+        { "_ZN9GameScene17changeNoticeSceneEiRKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEEbi", 0x1608470, R_JUMP_SLOT, &bf_notice_fn, (void *)bf_diag_notice, "notice" },
+    };
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+        const struct entry *e = &entries[i];
+        if (type != e->type || s->st_value != e->va || strcmp(name, e->name)) continue;
+        uintptr_t expected = 0;
+        if (!atomic_compare_exchange_strong_explicit(e->slot, &expected, (uintptr_t)original,
+                                                     memory_order_acq_rel, memory_order_acquire) && expected != (uintptr_t)original) {
+            tl_log_line("BF-AUTH-DIAG hook=%s skipped=another_image", e->label);
+            return original;
+        }
+        tl_log_line("BF-AUTH-DIAG hook=%s installed", e->label);
+        return (uint64_t)(uintptr_t)e->wrapper;
+    }
+    return original;
+}
+
 /* A copied page's data is relocated in its copy, which is what the rewritten code reads. In an older dylib layout the original
  * data page was writable too, and code that does not compute its data addresses with adrp/adr -- a literal load in the same page --
  * read that one, so the same relocation was applied there. The ld-style AOT dylib maps the whole image as r-x __TEXT (AMFI execSeg),
@@ -1847,6 +1967,8 @@ static bool reloc_one_into(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t
         uint64_t v = bind_symbol(L, symidx, &failed);
         if (failed) return false;
         if (v == 1 && L->symcache) v = 0;
+        if (type != R_ABS64)
+            v = bf_diag_relocation(L, sym_at(L, symidx), sym_name(L, sym_at(L, symidx)), type, v);
         *place = v + (type == R_ABS64 ? (uint64_t)addend : 0);
         return true;
     }
@@ -2886,6 +3008,7 @@ static bool relocate(tl_lib *L)
     free(L->symcache);
     L->symcache = NULL;
     if (!ok) { tl_log_line("ld: %s: relocation failed", L->name); return false; }
+    bf_diag_hook_report(L);
     size_t t = 0, a = 0, ad = 0, sv = 0;
     if (L->aot) {
         /* The code was rewritten when the dylib was made, and the slots the stubs read are this process's (map_library filled

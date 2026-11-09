@@ -3,6 +3,7 @@
 #include "husk-tl-jni.h"
 
 #include <pthread.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -482,6 +483,45 @@ void tl_jni_clear(void) { t_pending = NULL; }
 static void jni_ExceptionDescribe(void *env);
 static jvalue g_zero;
 
+/* Only the BF native-to-Java identifier calls. Values are never written to the log. */
+static void bf_diag_identifier(const tl_jmeth *m, jvalue result)
+{
+    if (!m->cls || !m->cls->name || strcmp(m->sig, "()Ljava/lang/String;")) return;
+    bool android_id = !strcmp(m->cls->name, "sg/gumi/bravefrontier/BraveFrontier") && !strcmp(m->name, "getAndroidId");
+    bool legacy = !strcmp(m->cls->name, "sg/gumi/bravefrontier/BraveFrontier") && !strcmp(m->name, "getLegacyDeviceUUID");
+    bool advertising = !strcmp(m->cls->name, "sg/gumi/bravefrontier/BraveFrontierJNI") && !strcmp(m->name, "getDeviceAdvertisingID");
+    if (!android_id && !legacy && !advertising) return;
+    int saved = errno;
+    bool threw = tl_jni_pending();
+    const char *s = threw ? NULL : tl_jni_string((jobj *)result.l);
+    size_t len = s ? strnlen(s, 129) : 0;
+    bool nonzero = false, zero_digit = false;
+    for (size_t i = 0; i < len && i < 129; ++i) {
+        if (s[i] == '0') zero_digit = true;
+        else if (s[i] != '-') nonzero = true;
+    }
+    if (android_id) {
+        /* The hash stays in memory and is never logged. Lock contention is reported as unknown. */
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        static uint64_t previous;
+        static bool seen;
+        const char *consistent = "unknown";
+        if (len && len <= 128 && pthread_mutex_trylock(&lock) == 0) {
+            uint64_t hash = 1469598103934665603ull;
+            for (size_t i = 0; i < len; ++i) hash = (hash ^ (unsigned char)s[i]) * 1099511628211ull;
+            if (seen) consistent = hash == previous ? "yes" : "no";
+            previous = hash; seen = true;
+            pthread_mutex_unlock(&lock);
+        }
+        tl_log_line("BF-AUTH-DIAG android_id present=%d usable=%d consistent=%s threw=%d", len > 0, len >= 8 && len <= 128 && nonzero, consistent, threw);
+    } else if (legacy) {
+        tl_log_line("BF-AUTH-DIAG legacy_uuid returned_nonempty=%d threw=%d", len > 0, threw);
+    } else {
+        tl_log_line("BF-AUTH-DIAG advertising_id present=%d all_zero=%d threw=%d", len > 0, len <= 128 && zero_digit && !nonzero, threw);
+    }
+    errno = saved;
+}
+
 static jvalue invoke(jobj *self, tl_jmeth *m, bool nonvirtual, const jvalue *args)
 {
     /* A host implementation wins over the APK's bytecode: Subway's AnalyticsBridge.SetupWorkerForAppClosed
@@ -502,6 +542,7 @@ static jvalue invoke(jobj *self, tl_jmeth *m, bool nonvirtual, const jvalue *arg
          * AndroidJavaException even when this method itself succeeded. */
         tl_jni_clear();
         fn(&c);
+        bf_diag_identifier(m, c.ret);
         /* A method that returns an object hands the caller a new local reference. The implementations
          * return objects they keep (the Activity, the Display), so without this a caller releasing its
          * reference would free an object that is still in use. */
@@ -510,6 +551,7 @@ static jvalue invoke(jobj *self, tl_jmeth *m, bool nonvirtual, const jvalue *arg
     }
     if (m->dvm && tl_dvm) {
         jvalue r = tl_dvm->invoke(m->dvm, self, nonvirtual, args);
+        bf_diag_identifier(m, r);
         if (g_trace >= 3) {
             tl_log_line("jni: java call %s.%s%s on %p -> %#llx%s", m->cls->name, m->name, m->sig, (void *)self, (unsigned long long)r.j, t_pending ? " (threw)" : "");
             if (t_pending) jni_ExceptionDescribe(NULL);
