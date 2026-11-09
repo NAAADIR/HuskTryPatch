@@ -323,6 +323,7 @@ static void XReq_do(tl_jcall *c)
         if (rd) {
             const int64_t CH = 64 * 1024;
             jobj *buf = tl_jni_new_prim_array('B', (uint32_t)CH);
+            if (!buf) return;
             jobj *stream = tl_jni_new_object(tl_jni_class(XIN));
             for (;;) {
                 int n = rd(env, stream, call, (int64_t)body_len, buf, 0, CH);
@@ -373,6 +374,7 @@ static void XRes_body(tl_jcall *c)
     jobj *stream = tl_jni_new_object(tl_jni_class(XOUT));
     const size_t CH = 64 * 1024;
     jobj *buf = tl_jni_new_prim_array('B', (uint32_t)CH);
+    if (!buf) { if (stream) { free(stream->fields); free(stream); } return; }
     for (size_t off = 0; off < r->rs.body_len;) {
         size_t n = r->rs.body_len - off < CH ? r->rs.body_len - off : CH;
         memcpy(buf->arr.data, r->rs.body + off, n);

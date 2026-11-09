@@ -874,6 +874,7 @@ NAT(G_bmCompress)
         CGImageDestinationFinalize(dst);
         CFRelease(opt); CFRelease(qn); CFRelease(dst);
         jobj *arr = tl_jni_new_prim_array('B', (uint32_t)CFDataGetLength(out));
+        if (!arr) { CFRelease(out); CGImageRelease(img); return false; }
         memcpy(arr->arr.data, CFDataGetBytePtr(out), (size_t)CFDataGetLength(out));
         *ret = Ll(arr);
     }

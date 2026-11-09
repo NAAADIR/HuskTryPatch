@@ -33,6 +33,17 @@ jobj *dvm_box(char k, jvalue v);
 static jvalue L(jobj *o) { jvalue r; r.j = 0; r.l = o; return r; }
 static jvalue Z(bool b) { jvalue r; r.j = 0; r.z = b; return r; }
 static jvalue I(int32_t v) { jvalue r; r.j = (uint32_t)v; return r; }
+static bool pending_oom(void) { jobj *e = tl_jni_pending_object(); return e && e->cls && e->cls->name && !strcmp(e->cls->name, "java/lang/OutOfMemoryError"); }
+/* Arrays constructed while decoding have not yet been exposed to Java. */
+static void free_annotation_arrays(jobj *a)
+{
+    if (!a) return;
+    if (a->kind == TL_K_PRIM_ARRAY) { free(a->arr.data); free(a); }
+    else if (a->kind == TL_K_OBJ_ARRAY) {
+        for (uint32_t i = 0; i < a->oarr.len; i++) free_annotation_arrays(a->oarr.v[i]);
+        free(a->oarr.v); free(a);
+    }
+}
 
 enum { VIS_BUILD = 0, VIS_RUNTIME = 1, VIS_SYSTEM = 2 };
 
@@ -229,6 +240,7 @@ static jobj *value_object(dvm_dex *d, const uint8_t **pp, const char *want)
         const char *elem = want && want[0] == '[' ? want + 1 : NULL;
         if (elem && elem[0] && !elem[1] && strchr("BSCIJFDZ", elem[0])) {
             jobj *arr = tl_jni_new_prim_array(elem[0], n);
+            if (!arr) return NULL;
             arr->refs = 1u << 30;
             for (uint32_t i = 0; i < n; i++) {
                 jvalue v = prim_value(pp, elem[0]);
@@ -249,7 +261,7 @@ static jobj *value_object(dvm_dex *d, const uint8_t **pp, const char *want)
         jobj *arr = tl_jni_new_obj_array(ec, n);
         arr->cls = tl_jni_class(an);
         arr->refs = 1u << 30;
-        for (uint32_t i = 0; i < n; i++) arr->oarr.v[i] = value_object(d, pp, elem);
+        for (uint32_t i = 0; i < n; i++) { arr->oarr.v[i] = value_object(d, pp, elem); if (tl_jni_pending()) { free_annotation_arrays(arr); return NULL; } }
         return arr;
     }
     default:
@@ -291,12 +303,13 @@ static jobj *make_annotation(dvm_dex *d, const uint8_t **pp)
         dvm_method *em = element_method(adc, name);
         const char *rt = em ? em->sig + 2 : NULL;
         jobj *v = value_object(d, &p, rt);
+        if (pending_oom()) { free(members->oarr.v); free(members); return NULL; }
         if (!em) continue;
         if (tl_jni_pending()) { tl_jni_clear(); continue; }
         tl_jclass *rc = class_by_desc(rt);
         jobj *m = dvm_new_object(mc);
         jvalue args[4] = { L(dvm_new_string_utf8(name)), L(v), L(rc ? rc->mirror : NULL), L(dvm_make_executable(em)) }, r;
-        if (!dvm_call(mctor, m, args, &r)) { tl_jni_clear(); continue; }
+        if (!dvm_call(mctor, m, args, &r)) { if (pending_oom()) { free(members->oarr.v); free(members); return NULL; } tl_jni_clear(); continue; }
         members->oarr.v[k++] = m;
     }
     members->oarr.len = k;
@@ -306,6 +319,7 @@ static jobj *make_annotation(dvm_dex *d, const uint8_t **pp)
                             "(Ljava/lang/Class;[Llibcore/reflect/AnnotationMember;)Ljava/lang/annotation/Annotation;", args, &r)) {
         char buf[300];
         tl_log_line("dvm: making a %s annotation threw %s", desc, tl_dvm_describe_pending(buf, sizeof(buf)) ? buf : "?");
+        if (pending_oom()) return NULL;
         tl_jni_clear();
         return NULL;
     }
@@ -331,6 +345,7 @@ static jobj *all_runtime(dvm_dex *d, const uint8_t *set)
         if (item[0] != VIS_RUNTIME) continue;
         const uint8_t *p = item + 1;
         jobj *o = make_annotation(d, &p);
+        if (tl_jni_pending()) { free_annotation_arrays(arr); return NULL; }
         if (o) arr->oarr.v[k++] = o;
     }
     arr->oarr.len = k;
@@ -504,6 +519,7 @@ NAT(An_Exe_getParameterAnnotations)
     for (int i = 0; i < np; i++) {
         uint32_t off = (uint32_t)i < n ? rd32(list + 4 + 4 * i) : 0;
         outer->oarr.v[i] = off ? all_runtime(m->cls->dex, m->cls->dex->b + off) : annotation_array(0);
+        if (tl_jni_pending()) { free_annotation_arrays(outer); return false; }
     }
     *ret = L(outer);
     return !tl_jni_pending();

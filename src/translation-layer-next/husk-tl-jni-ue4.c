@@ -163,7 +163,7 @@ static void GA_fontDir(tl_jcall *c) { c->ret = vl(tl_jni_new_string("/system/fon
 const char *tl_hle_android_id(void);
 static void GA_androidId(tl_jcall *c) { c->ret = vl(tl_jni_new_string(tl_hle_android_id())); }
 static void GA_refresh(tl_jcall *c) { c->ret = vi(60); }
-static void GA_refreshRates(tl_jcall *c) { jobj *a = tl_jni_new_prim_array('I', 1); ((int *)a->arr.data)[0] = 60; c->ret = vl(a); }
+static void GA_refreshRates(tl_jcall *c) { jobj *a = tl_jni_new_prim_array('I', 1); if (!a) return; ((int *)a->arr.data)[0] = 60; c->ret = vl(a); }
 static void GA_orientation(tl_jcall *c) { c->ret = vi(1); }                    /* landscape */
 static void GA_netType(tl_jcall *c) { c->ret = vi(1); }                        /* Wi-Fi */
 static void GA_netTime(tl_jcall *c) { c->ret = vj(0); }

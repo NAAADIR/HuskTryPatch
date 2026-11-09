@@ -42,9 +42,17 @@ NAT(Object_internalClone)
     jobj *c;
     if (self->kind == TL_K_PRIM_ARRAY) {
         c = tl_jni_new_prim_array(self->arr.etype, self->arr.len);
+        if (!c || !c->arr.data) {
+            free(c);
+            return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "array clone allocation failed");
+        }
         memcpy(c->arr.data, self->arr.data, (size_t)self->arr.len * self->arr.esz);
     } else if (self->kind == TL_K_OBJ_ARRAY) {
         c = tl_jni_new_obj_array(NULL, self->oarr.len);
+        if (!c || !c->oarr.v) {
+            free(c);
+            return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "array clone allocation failed");
+        }
         c->cls = self->cls;
         memcpy(c->oarr.v, self->oarr.v, (size_t)self->oarr.len * sizeof(jobj *));
     } else if (self->kind == TL_K_STRING) {
@@ -192,6 +200,7 @@ NAT(String_toCharArray)
     (void)a;
     int32_t n; const uint16_t *s = chars(self, &n);
     jobj *arr = tl_jni_new_prim_array('C', (uint32_t)n);
+    if (!arr) return false;
     arr->refs = 1u << 30;
     memcpy(arr->arr.data, s, (size_t)n * 2);
     *ret = L(arr);
@@ -299,6 +308,10 @@ NAT(System_arraycopy)
     uint32_t sl = so ? src->oarr.len : src->arr.len, dl = dobj ? dst->oarr.len : dst->arr.len;
     if (sp < 0 || dp < 0 || n < 0 || (uint32_t)sp + (uint32_t)n > sl || (uint32_t)dp + (uint32_t)n > dl)
         return dvm_throw("java/lang/ArrayIndexOutOfBoundsException", "arraycopy: src %u+%d, dst %u+%d, length %d", sl, sp, dl, dp, n);
+    /* Even a zero-length memmove must not form pointers from null storage. */
+    if (n == 0) return true;
+    if ((so && (!src->oarr.v || !dst->oarr.v)) || (!so && (!src->arr.data || !dst->arr.data)))
+        return dvm_throw("java/lang/OutOfMemoryError", "arraycopy: array backing storage is unavailable");
     if (so) memmove(dst->oarr.v + dp, src->oarr.v + sp, (size_t)n * sizeof(jobj *));
     else memmove((uint8_t *)dst->arr.data + (size_t)dp * dst->arr.esz, (uint8_t *)src->arr.data + (size_t)sp * src->arr.esz, (size_t)n * src->arr.esz);
     return true;
@@ -345,6 +358,7 @@ NAT(Memory_peekByteArray)
 static jobj *bytes_of(const uint8_t *b, size_t n)
 {
     jobj *arr = tl_jni_new_prim_array('B', (uint32_t)n);
+    if (!arr) return NULL;
     arr->refs = 1u << 30;
     memcpy(arr->arr.data, b, n);
     return arr;
@@ -369,7 +383,7 @@ NAT(CharsetUtils_toUtf8Bytes)
     }
     *ret = L(bytes_of(b, k));
     free(b);
-    return true;
+    return !tl_jni_pending();
 }
 static bool narrow(jobj *s, int32_t off, int32_t len, uint16_t max, jvalue *ret)
 {
@@ -380,7 +394,7 @@ static bool narrow(jobj *s, int32_t off, int32_t len, uint16_t max, jvalue *ret)
     for (int32_t i = 0; i < len; i++) b[i] = c[off + i] <= max ? (uint8_t)c[off + i] : '?';
     *ret = L(bytes_of(b, (size_t)len));
     free(b);
-    return true;
+    return !tl_jni_pending();
 }
 NAT(CharsetUtils_toAsciiBytes) { (void)self; return narrow(a[0].l, a[1].i, a[2].i, 0x7F, ret); }
 NAT(CharsetUtils_toIsoLatin1Bytes) { (void)self; return narrow(a[0].l, a[1].i, a[2].i, 0xFF, ret); }
@@ -437,6 +451,7 @@ NAT(VMStack_threadStackTrace)
         void *fr[512]; uint32_t pcs[512];
         int n = dvm_capture_frames(fr, pcs, 512);
         jobj *bt = tl_jni_new_prim_array('J', (uint32_t)(2 * n));
+        if (!bt) return false;
         int64_t *v = bt->arr.data;
         for (int i = 0; i < n; i++) { v[2 * i] = (int64_t)(uintptr_t)fr[i]; v[2 * i + 1] = pcs[i]; }
         jvalue p[1]; p[0].j = 0; p[0].l = bt;
@@ -547,14 +562,17 @@ NAT(VMR_newArray)
     (void)self;
     jobj *cls = a[0].l; int32_t n = a[1].i;
     if (!cls || cls->kind != TL_K_CLASS) return npe("component type");
+    if (n < 0) return dvm_throw("java/lang/NegativeArraySizeException", "%d", n);
     dvm_class *c = dvm_class_of(cls->klass.jc);
     jobj *arr;
     if (c && c->prim) arr = tl_jni_new_prim_array(c->prim, (uint32_t)n);
     else {
         arr = tl_jni_new_obj_array(cls->klass.jc, (uint32_t)n);
+        if (!arr || !arr->oarr.v) { free(arr); return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "array allocation failed"); }
         char nm[400]; snprintf(nm, sizeof(nm), cls->klass.jc->name[0] == '[' ? "[%s" : "[L%s;", cls->klass.jc->name);
         arr->cls = tl_jni_class(nm);
     }
+    if (!arr) return false;
     arr->refs = 1u << 30;
     *ret = L(arr);
     return true;
@@ -809,6 +827,7 @@ NAT(Throwable_fill)
         skip++;
     }
     jobj *arr = tl_jni_new_prim_array('J', (uint32_t)(2 * (n - skip)));
+    if (!arr) return false;
     arr->refs = 1u << 30;
     int64_t *v = arr->arr.data;
     for (int i = skip; i < n; i++) { v[2 * (i - skip)] = (int64_t)(uintptr_t)fr[i]; v[2 * (i - skip) + 1] = pcs[i]; }
@@ -1785,19 +1804,30 @@ NAT(Array_createObjectArray)
     return true;
 }
 /* new T[a][b]...: nested arrays, the innermost of T */
+static void free_unpublished_multi_array(jobj *a)
+{
+    if (!a) return;
+    if (a->kind == TL_K_OBJ_ARRAY) {
+        for (uint32_t i = 0; i < a->oarr.len; i++) free_unpublished_multi_array(a->oarr.v[i]);
+        free(a->oarr.v);
+    } else free(a->arr.data);
+    free(a);
+}
 static jobj *multi_array(const char *elem_desc, const int32_t *dims, int ndims)
 {
     char name[400];
     snprintf(name, sizeof(name), "%.*s%s", ndims, "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[", elem_desc);
     if (ndims == 1) {
-        if (elem_desc[0] != 'L' && elem_desc[0] != '[') { jobj *a = tl_jni_new_prim_array(elem_desc[0], (uint32_t)dims[0]); a->refs = 1u << 30; return a; }
+        if (elem_desc[0] != 'L' && elem_desc[0] != '[') { jobj *a = tl_jni_new_prim_array(elem_desc[0], (uint32_t)dims[0]); if (!a) return NULL; a->refs = 1u << 30; return a; }
         jobj *a = tl_jni_new_obj_array(NULL, (uint32_t)dims[0]);
+        if (!a || !a->oarr.v) { free(a); if (!tl_jni_pending()) tl_jni_throw("java/lang/OutOfMemoryError", "array allocation failed"); return NULL; }
         a->cls = tl_jni_class(name); a->refs = 1u << 30;
         return a;
     }
     jobj *a = tl_jni_new_obj_array(NULL, (uint32_t)dims[0]);
+    if (!a || !a->oarr.v) { free(a); if (!tl_jni_pending()) tl_jni_throw("java/lang/OutOfMemoryError", "array allocation failed"); return NULL; }
     a->cls = tl_jni_class(name); a->refs = 1u << 30;
-    for (int32_t i = 0; i < dims[0]; i++) a->oarr.v[i] = multi_array(elem_desc, dims + 1, ndims - 1);
+    for (int32_t i = 0; i < dims[0]; i++) { a->oarr.v[i] = multi_array(elem_desc, dims + 1, ndims - 1); if (!a->oarr.v[i]) { free_unpublished_multi_array(a); return NULL; } }
     return a;
 }
 NAT(Array_createMultiArray)
@@ -1814,7 +1844,7 @@ NAT(Array_createMultiArray)
     else if (cls->klass.jc->name[0] == '[') snprintf(desc, sizeof(desc), "%s", cls->klass.jc->name);
     else snprintf(desc, sizeof(desc), "L%s;", cls->klass.jc->name);
     *ret = L(multi_array(desc, d, n));
-    return true;
+    return !tl_jni_pending();
 }
 NAT(VMStack_null) { UNUSED; *ret = L(NULL); return true; }
 /* getStackClass2: the caller of the method that called the method asking (frames: getStackClass2, getCallerClass, its caller, X). */

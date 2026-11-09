@@ -787,19 +787,21 @@ typedef struct mon { pthread_mutex_t mu; pthread_cond_t cv; _Atomic(pthread_t) o
 
 static mon *monitor_of(jobj *o)
 {
-    mon *m = o->monitor;
+    mon *m = __atomic_load_n(&o->monitor, __ATOMIC_ACQUIRE);
     if (m) return m;
     mon *n = calloc(1, sizeof(*n));
     pthread_mutex_init(&n->mu, NULL);
     pthread_cond_init(&n->cv, NULL);
     pthread_mutex_lock(&g_lock);
-    if (!o->monitor) o->monitor = n; else { pthread_mutex_destroy(&n->mu); free(n); }
+    m = __atomic_load_n(&o->monitor, __ATOMIC_RELAXED);
+    if (!m) { m = n; __atomic_store_n(&o->monitor, m, __ATOMIC_RELEASE); }
+    else { pthread_cond_destroy(&n->cv); pthread_mutex_destroy(&n->mu); free(n); }
     pthread_mutex_unlock(&g_lock);
-    return o->monitor;
+    return m;
 }
 static bool mon_mine(mon *m) { pthread_t w = atomic_load(&m->owner); return w && pthread_equal(w, pthread_self()); }
 /* Thread.holdsLock: whether this thread is inside a synchronized block on o (Facebook's loader asserts it is not before taking a file lock) */
-bool dvm_holds_lock(jobj *o) { mon *m = o ? o->monitor : NULL; return m && mon_mine(m); }
+bool dvm_holds_lock(jobj *o) { mon *m = o ? __atomic_load_n(&o->monitor, __ATOMIC_ACQUIRE) : NULL; return m && mon_mine(m); }
 void dvm_monitor_enter(jobj *o)
 {
     mon *m = monitor_of(o);
@@ -1388,9 +1390,14 @@ static jobj *new_array(tl_jclass *arrcls, int32_t n)
     if (name[1] == 'L' || name[1] == '[') {
         char elem[400]; desc_to_name(name + 1, elem, sizeof(elem));
         a = tl_jni_new_obj_array(class_for_desc(name + 1), (uint32_t)n);
-        a->cls = arrcls;
+        if (a) a->cls = arrcls;
     } else {
         a = tl_jni_new_prim_array(name[1], (uint32_t)n);
+    }
+    /* Never publish an array whose backing allocation failed. */
+    if (!a || (a->kind == TL_K_OBJ_ARRAY ? !a->oarr.v : !a->arr.data)) {
+        free(a);
+        return NULL;
     }
     a->refs = 1u << 30;
     return a;
@@ -1715,7 +1722,9 @@ dispatch:;
         THROW_IF((uint64_t)n * esz > (256ull << 20) &&
                  !dvm_throw("java/lang/OutOfMemoryError", "Failed to allocate a %llu byte allocation with 0 free bytes",
                             (unsigned long long)((uint64_t)n * esz)));
-        WL(regs, A4, new_array(ac, n));
+        jobj *a = new_array(ac, n);
+        THROW_IF(!a && (tl_jni_pending() || !dvm_throw("java/lang/OutOfMemoryError", "array allocation failed")));
+        WL(regs, A4, a);
         NEXT(2);
     }
     case 0x24: case 0x25: {                                        /* filled-new-array(/range) */
@@ -1723,6 +1732,7 @@ dispatch:;
         int count = range ? AA : B4;
         tl_jclass *ac = resolve_type(dex, FETCH(1));
         jobj *a = new_array(ac, count);
+        THROW_IF(!a && (tl_jni_pending() || !dvm_throw("java/lang/OutOfMemoryError", "array allocation failed")));
         uint16_t list = FETCH(2);
         for (int i = 0; i < count; i++) {
             int reg = range ? list + i : (i < 4 ? (list >> (4 * i)) & 0xF : A4);
@@ -2224,6 +2234,7 @@ void tl_dvm_drop_app(void)
 static jobj *dex_cookie(int first, int count)
 {
     jobj *c = tl_jni_new_prim_array('J', 2);
+    if (!c) return NULL;
     c->refs = 1u << 30;
     ((int64_t *)c->arr.data)[0] = first; ((int64_t *)c->arr.data)[1] = count;
     return c;
@@ -2266,7 +2277,7 @@ static bool DexFile_open(jobj *self, const jvalue *a, jvalue *ret)
     if (g_dvm_trace >= 1) tl_log_line("dvm: DexFile %s: dexes %d..%d", path, first, first + count - 1);
     note_loader(first, count, a[3].l);       /* openDexFileNative(source, output, flags, loader, elements) */
     ret->l = dex_cookie(first, count);
-    return true;
+    return !tl_jni_pending();
 }
 
 /* openInMemoryDexFilesNative(ByteBuffer[] bufs, byte[][] arrays, int[] starts, int[] ends, loader, elements) */
@@ -2304,7 +2315,7 @@ static bool DexFile_openInMemory(jobj *self, const jvalue *a, jvalue *ret)
     if (!count) return dvm_throw("java/io/IOException", "no dex in memory");
     note_loader(first, count, a[4].l);
     ret->l = dex_cookie(first, count);
-    return true;
+    return !tl_jni_pending();
 }
 
 static bool cookie_range(jobj *c, int *first, int *count)

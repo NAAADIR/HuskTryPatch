@@ -54,6 +54,7 @@ static uint8_t *b64_decode(const uint8_t *in, size_t n, size_t *out_n)
 static jobj *bytes_array(const uint8_t *p, size_t n)
 {
     jobj *a = tl_jni_new_prim_array('B', (uint32_t)n);
+    if (!a) return NULL;
     if (n) memcpy(a->arr.data, p, n);
     return a;
 }
@@ -208,6 +209,7 @@ static void Arrays_copyOfRange(tl_jcall *c)
     if (!a || a->kind != TL_K_PRIM_ARRAY) { tl_jni_throw("java/lang/NullPointerException", "array"); c->ret = vl(NULL); return; }
     if (from < 0 || from > (int)a->arr.len || from > to) { tl_jni_throw("java/lang/ArrayIndexOutOfBoundsException", "copyOfRange"); c->ret = vl(NULL); return; }
     jobj *r = tl_jni_new_prim_array(a->arr.etype, (uint32_t)(to - from));
+    if (!r) return;
     size_t avail = (size_t)((int)a->arr.len - from), want = (size_t)(to - from), n = avail < want ? avail : want;
     memcpy(r->arr.data, (const uint8_t *)a->arr.data + (size_t)from * a->arr.esz, n * a->arr.esz);
     c->ret = vl(r);
@@ -217,6 +219,7 @@ static void Arrays_copyOf(tl_jcall *c)
     jobj *a = c->args[0].l; int len = c->args[1].i;
     if (!a || a->kind != TL_K_PRIM_ARRAY || len < 0) { tl_jni_throw("java/lang/NullPointerException", "array"); c->ret = vl(NULL); return; }
     jobj *r = tl_jni_new_prim_array(a->arr.etype, (uint32_t)len);
+    if (!r) return;
     size_t n = (uint32_t)len < a->arr.len ? (size_t)len : a->arr.len;
     memcpy(r->arr.data, a->arr.data, n * a->arr.esz);
     c->ret = vl(r);

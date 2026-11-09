@@ -267,6 +267,7 @@ NAT(P_marshall)
     npcl *n = of(a[0].j);
     if (!n) { *ret = L(NULL); return true; }
     jobj *arr = tl_jni_new_prim_array('B', n->size);
+    if (!arr) return false;
     if (arr && n->buf && n->size) memcpy(arr->arr.data, n->buf, n->size);
     *ret = L(arr);
     return true;

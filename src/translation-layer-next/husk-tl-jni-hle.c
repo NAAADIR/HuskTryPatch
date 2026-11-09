@@ -886,7 +886,7 @@ static void String_init_chars(tl_jcall *c)
 static void String_getBytes(tl_jcall *c)
 {
     const char *s = S(c->self); size_t n = strlen(s);
-    jobj *a = tl_jni_new_prim_array('B', (uint32_t)n); memcpy(a->arr.data, s, n);
+    jobj *a = tl_jni_new_prim_array('B', (uint32_t)n); if (!a) return; memcpy(a->arr.data, s, n);
     c->ret = vl(a);
 }
 

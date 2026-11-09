@@ -184,7 +184,8 @@ public final class ViewRoot implements ViewParent {
     /** HuskPatch: the screen (the app's window over Husk) changed size: every window lays out again at the new size, which
      *  performLayout reads from Native.screenWidth/Height. */
     public static void screenResized() {
-        int sw = screenW(), sh = screenH();
+        long size = Native.screenSize();
+        int sw = (int) (size >>> 32), sh = (int) size;
         for (ViewRoot v : sRoots) {
             // what apps size themselves from: the display metrics and the configuration's screen size and orientation
             android.content.res.Resources res = v.mView.getContext().getResources();

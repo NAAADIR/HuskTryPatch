@@ -27,6 +27,7 @@ public final class Native {
     public static native String packageName();
     public static native int screenWidth();
     public static native int screenHeight();
+    public static native long screenSize();
     public static native float density();
     public static native void startGL(Object view, Object renderer, int esVersion);
     public static native void requestRender();

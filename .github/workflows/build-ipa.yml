@@ -101,6 +101,7 @@ jobs:
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'composed center rgba=' > /dev/null
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'renderdiag: route=host-glsurfaceview' > /dev/null
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'renderdiag: sample stage=' > /dev/null
+          strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'primitive array allocation failed' > /dev/null
           shasum -a 256 "$RUNNER_TEMP/ipa-Husk"
           echo "IPA executable contains the Java compositor diagnostic from $GITHUB_SHA"
 

@@ -125,6 +125,7 @@ void tl_cocos_deliver_bitmap(int width, int height, const uint8_t *rgba)
     if (!fn) return;
     size_t n = (size_t)width * (size_t)height * 4;
     jobj *arr = tl_jni_new_prim_array('B', (uint32_t)n);
+    if (!arr) return;
     memcpy(arr->arr.data, rgba, n);
     fn(tl_jni_env(), tl_jni_class_object("org/cocos2dx/lib/Cocos2dxBitmap"), width, height, arr);
     tl_jni_unref(arr);
@@ -229,7 +230,15 @@ static void drain_events(void)
             else if (e->phase == 1 || e->phase == 3) {
                 many_fn fn = e->phase == 1 ? move : cancel;
                 if (!fn) break;
-                jobj *ids = tl_jni_new_prim_array('I', 1), *xs = tl_jni_new_prim_array('F', 1), *ys = tl_jni_new_prim_array('F', 1);
+                jobj *ids = tl_jni_new_prim_array('I', 1), *xs = NULL, *ys = NULL;
+                if (ids) xs = tl_jni_new_prim_array('F', 1);
+                if (xs) ys = tl_jni_new_prim_array('F', 1);
+                if (!ids || !xs || !ys) {
+                    if (ids) { free(ids->arr.data); free(ids); }
+                    if (xs) { free(xs->arr.data); free(xs); }
+                    for (int j = i + 1; j < n; j++) free(ev[j].text);
+                    return;
+                }
                 ((int *)ids->arr.data)[0] = e->id; ((float *)xs->arr.data)[0] = e->x; ((float *)ys->arr.data)[0] = e->y;
                 fn(env, cls, ids, xs, ys);
                 tl_jni_unref(ids); tl_jni_unref(xs); tl_jni_unref(ys);

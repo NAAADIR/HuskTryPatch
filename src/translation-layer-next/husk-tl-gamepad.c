@@ -151,6 +151,7 @@ static void ID_getDeviceIds(tl_jcall *c)
     int ids[TL_PADS], n = 0;
     for (int s = 0; s < TL_PADS; s++) if (P.connected[s]) ids[n++] = DEVICE_BASE + s;
     jobj *a = tl_jni_new_prim_array('I', (uint32_t)n);
+    if (!a) return;
     if (n) memcpy(a->arr.data, ids, (size_t)n * sizeof(int));
     c->ret = vl(a);
 }
@@ -173,6 +174,7 @@ static void ID_hasKeys(tl_jcall *c)
     jobj *keys = c->args[0].l;
     uint32_t n = keys && keys->kind == TL_K_PRIM_ARRAY ? keys->arr.len : 0;
     jobj *out = tl_jni_new_prim_array('Z', n);
+    if (!out) return;
     for (uint32_t i = 0; i < n; i++) {
         int k = ((int *)keys->arr.data)[i];
         ((uint8_t *)out->arr.data)[i] = (k >= 96 && k <= 110) || (k >= 19 && k <= 23) || k == 4;

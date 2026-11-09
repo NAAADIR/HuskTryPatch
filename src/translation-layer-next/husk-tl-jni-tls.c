@@ -97,6 +97,7 @@ static void Cert_getEncoded(tl_jcall *c)
     const der_cert *d = c->self ? c->self->native : NULL;
     if (!d) return;
     jobj *a = tl_jni_new_prim_array('B', (uint32_t)d->len);
+    if (!a) return;
     memcpy(a->arr.data, d->der, d->len);
     c->ret = vl(a);
 }

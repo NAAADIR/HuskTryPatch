@@ -27,7 +27,7 @@ cc $CFLAGS -o "$OUT/plan_test" "$HERE/plan_test.c" "$SRC/husk-tl-elf.c"
 echo "== scanner"
 cc $CFLAGS -fsanitize=address,undefined -o "$OUT/scan_cli" "$HERE/scan_cli.c" \
     "$SRC"/husk-tl-json.c "$SRC"/husk-tl-zip.c "$SRC"/husk-tl-elf.c \
-    "$SRC"/husk-tl-scan.c "$SRC"/husk-tl-probe.c -lz -lpthread
+    "$SRC"/husk-tl-scan.c "$SRC"/husk-tl-probe.c "$HERE/prewarm_stub.c" -lz -lpthread
 python3 "$HERE/test_scan.py" "$OUT" "$OUT/scan_cli"
 
 echo "== device checks, arm64 under qemu-user"
@@ -44,7 +44,7 @@ void *husk_tl_read_entry(const char *a, const char *b, size_t l, size_t *o)
 { (void)a; (void)b; (void)l; *o = 0; return NULL; }
 EOF
 aarch64-linux-gnu-gcc $CFLAGS -static -o "$OUT/checks_arm64" "$HERE/scan_cli.c" \
-    "$OUT/noscan.c" "$SRC"/husk-tl-json.c "$SRC"/husk-tl-probe.c \
+    "$OUT/noscan.c" "$HERE/prewarm_stub.c" "$SRC"/husk-tl-json.c "$SRC"/husk-tl-probe.c \
     -Wl,--defsym=husk_tl_free=free -lpthread
 python3 - "$OUT/checks_arm64" <<'EOF'
 import json, subprocess, sys

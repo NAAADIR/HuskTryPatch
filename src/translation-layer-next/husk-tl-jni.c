@@ -38,6 +38,7 @@ static uint32_t hash_str(const char *s) { uint32_t h = 2166136261u; while (*s) {
 static jobj *obj_alloc(uint8_t kind, tl_jclass *cls)
 {
     jobj *o = calloc(1, sizeof(*o));
+    if (!o) return NULL;
     o->refs = 1;
     o->kind = kind;
     o->cls = cls;
@@ -172,13 +173,22 @@ static uint8_t esz_of(char t)
     switch (t) { case 'Z': case 'B': return 1; case 'C': case 'S': return 2; case 'I': case 'F': return 4; default: return 8; }
 }
 
-jobj *tl_jni_new_prim_array(char etype, uint32_t len)
+jobj *tl_jni_try_new_prim_array(char etype, uint32_t len)
 {
     if (etype == 'Z' || etype == 'B' || etype == 'C' || etype == 'S' || etype == 'I' || etype == 'J' || etype == 'F' || etype == 'D') { /* ok */ }
     char cn[4] = { '[', etype, 0 };
     jobj *o = obj_alloc(TL_K_PRIM_ARRAY, tl_jni_class(cn));
+    if (!o) return NULL;
     o->arr.esz = esz_of(etype); o->arr.etype = etype; o->arr.len = len;
     o->arr.data = calloc(len ? len : 1, o->arr.esz);
+    if (!o->arr.data) { free(o); return NULL; }
+    return o;
+}
+
+jobj *tl_jni_new_prim_array(char etype, uint32_t len)
+{
+    jobj *o = tl_jni_try_new_prim_array(etype, len);
+    if (!o && !tl_jni_pending()) tl_jni_throw("java/lang/OutOfMemoryError", "primitive array allocation failed");
     return o;
 }
 
@@ -187,6 +197,7 @@ jobj *tl_jni_new_obj_array(tl_jclass *elem, uint32_t len)
     char cn[1024];
     snprintf(cn, sizeof(cn), "[L%s;", elem ? elem->name : "java/lang/Object");
     jobj *o = obj_alloc(TL_K_OBJ_ARRAY, tl_jni_class(cn));
+    if (!o) return NULL;
     o->oarr.len = len;
     o->oarr.v = calloc(len ? len : 1, sizeof(jobj *));
     return o;
@@ -1056,10 +1067,21 @@ static void jni_GetStringUTFRegion(void *env, jo s, int32_t start, int32_t len, 
 /* --- arrays --- */
 
 static int32_t jni_GetArrayLength(void *env, jo a) { (void)env; return a ? (int32_t)(a->kind == TL_K_OBJ_ARRAY ? a->oarr.len : a->arr.len) : 0; }
+/* JNI entry points must not return an array with missing storage. Internal
+ * constructors have legacy callers that need a separate allocation audit. */
+static jo jni_array_result(jo a)
+{
+    if (a && (a->kind == TL_K_OBJ_ARRAY ? a->oarr.v != NULL : a->arr.data != NULL)) return a;
+    free(a);
+    if (!tl_jni_pending()) tl_jni_throw("java/lang/OutOfMemoryError", "array allocation failed");
+    return NULL;
+}
 static jo jni_NewObjectArray(void *env, int32_t len, jo cls, jo init)
 {
     (void)env;
-    jo a = tl_jni_new_obj_array(cls ? cls->klass.jc : NULL, (uint32_t)len);
+    if (len < 0) { if (!tl_jni_pending()) tl_jni_throw("java/lang/NegativeArraySizeException", "negative array size"); return NULL; }
+    jo a = jni_array_result(tl_jni_new_obj_array(cls ? cls->klass.jc : NULL, (uint32_t)len));
+    if (!a) return NULL;
     for (int32_t i = 0; init && i < len; i++) a->oarr.v[i] = tl_jni_ref(init);
     return a;
 }
@@ -1077,7 +1099,7 @@ static void jni_SetObjectArrayElement(void *env, jo a, int32_t i, jo v)
     X(Int, int32_t, 'I') X(Long, int64_t, 'J') X(Float, float, 'F') X(Double, double, 'D')
 
 #define GEN_ARRAYS(T, CT, K) \
-    static jo jni_New##T##Array(void *env, int32_t len) { (void)env; return tl_jni_new_prim_array(K, (uint32_t)len); } \
+    static jo jni_New##T##Array(void *env, int32_t len) { (void)env; if (len < 0) { if (!tl_jni_pending()) tl_jni_throw("java/lang/NegativeArraySizeException", "negative array size"); return NULL; } return jni_array_result(tl_jni_new_prim_array(K, (uint32_t)len)); } \
     static CT *jni_Get##T##ArrayElements(void *env, jo a, uint8_t *copy) { (void)env; if (copy) *copy = 0; return a ? a->arr.data : NULL; } \
     static void jni_Release##T##ArrayElements(void *env, jo a, CT *e, int32_t mode) { (void)env; (void)a; (void)e; (void)mode; } \
     static void jni_Get##T##ArrayRegion(void *env, jo a, int32_t s, int32_t n, CT *buf) { (void)env; \

@@ -475,11 +475,12 @@ static void send_metrics(void)
     char sig[192];
     if (!declared_sig("nativeSetViewportMetrics", sig, sizeof(sig))) return;
     jvalue a[40]; int n = 0, ints = 0, after = 0;
+    jobj *pending_arrays[40]; int npending = 0;
     bool past_arrays = false;
     a[n++].j = F.shell;
     for (const char *p = sig + 2; *p && *p != ')' && n < 40; p++) {     /* after the J */
         if (*p == 'F') { a[n++] = vf(F.ratio); continue; }
-        if (*p == '[') { while (*p == '[') p++; if (*p == 'L') p = strchr(p, ';'); a[n++] = vl(tl_jni_new_prim_array('I', 0)); past_arrays = true; continue; }
+        if (*p == '[') { while (*p == '[') p++; if (*p == 'L') p = strchr(p, ';'); jobj *v = tl_jni_new_prim_array('I', 0); if (!v) { for (int i = 0; i < npending; i++) { free(pending_arrays[i]->arr.data); free(pending_arrays[i]); } return; } pending_arrays[npending++] = v; a[n++] = vl(v); past_arrays = true; continue; }
         if (*p == 'I' && past_arrays) {
             /* newer engines: the view's size constraints (min width, max width, min height, max height: a view of exactly the
              * surface), then the display's corner radii (none) */

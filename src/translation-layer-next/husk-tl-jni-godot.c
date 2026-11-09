@@ -77,6 +77,7 @@ static void IO_openURI(tl_jcall *c) { tl_log_line("godot: the game asked to open
 static void IO_safeArea(tl_jcall *c)
 {
     jobj *a = tl_jni_new_prim_array('I', 4);
+    if (!a) return;
     int32_t *v = (int32_t *)a->arr.data;
     v[0] = 0; v[1] = 0; v[2] = G.w; v[3] = G.h;
     c->ret = vl(a);

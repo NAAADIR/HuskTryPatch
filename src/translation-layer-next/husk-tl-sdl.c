@@ -387,6 +387,7 @@ static void A_inputDeviceIds(tl_jcall *c)
     if (getenv("TL_SDL_TRACE")) tl_log_line("sdl: inputGetInputDeviceIds(%#x)", sources);
     bool touch = (sources & 0x1002) == 0x1002 || (sources & 0x100008) || (sources & 0x200000);          /* SOURCE_TOUCHSCREEN, _TOUCHPAD, _TOUCH_NAVIGATION */
     jobj *a = tl_jni_new_prim_array('I', touch ? 1 : 0);
+    if (!a) return;
     if (touch) { ((int *)a->arr.data)[0] = 1; S.touch_as_mouse = true; }
     c->ret = vl(a);
 }

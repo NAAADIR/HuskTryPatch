@@ -94,6 +94,7 @@ static void GU_openWebview(tl_jcall *c)
 static void GU_screenInsets(tl_jcall *c)
 {
     jobj *a = tl_jni_new_prim_array('I', 4);
+    if (!a) return;
     memset(a->arr.data, 0, 4 * sizeof(int32_t));
     c->ret = vl(a);
 }

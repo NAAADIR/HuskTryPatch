@@ -86,7 +86,10 @@ void *tl_jni_env(void);
 jobj *tl_jni_new_object(tl_jclass *cls);
 jobj *tl_jni_new_string(const char *utf8);
 const char *tl_jni_string(const jobj *s);                     /* NULL for NULL / not a string */
+/* Returns NULL on allocation failure, preserving any pending exception or setting OutOfMemoryError. */
 jobj *tl_jni_new_prim_array(char etype, uint32_t len);
+/* For callers holding locks: on failure return NULL without creating an exception. */
+jobj *tl_jni_try_new_prim_array(char etype, uint32_t len);
 jobj *tl_jni_new_obj_array(tl_jclass *elem, uint32_t len);
 jobj *tl_jni_ref(jobj *o);                                    /* a new reference to the same object */
 void  tl_jni_unref(jobj *o);

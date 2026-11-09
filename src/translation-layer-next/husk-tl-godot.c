@@ -243,6 +243,7 @@ static void send_touch(const event *e)
     }
     int per = U.major >= 4 ? 6 : 3;
     jobj *pos = tl_jni_new_prim_array('F', (uint32_t)(T.n * per));
+    if (!pos) goto finish_touch;
     float *p = (float *)pos->arr.data;
     for (int i = 0; i < T.n; i++) {
         p[i * per] = (float)T.ids[i]; p[i * per + 1] = T.x[i]; p[i * per + 2] = T.y[i];
@@ -253,6 +254,7 @@ static void send_touch(const event *e)
     else if (fn3b) fn3b(tl_jni_env(), tl_jni_class_object(LIB), 0x1002, action, e->id, T.n, pos, 0);
     else fn3c(tl_jni_env(), tl_jni_class_object(LIB), 0x1002, action, e->id, T.n, pos, 0, 0.f, 0.f);
     tl_jni_unref(pos);
+finish_touch:
     if (e->phase >= 2) {
         if (e->phase == 3) T.n = 0;
         else { for (int i = idx; i + 1 < T.n; i++) { T.ids[i] = T.ids[i + 1]; T.x[i] = T.x[i + 1]; T.y[i] = T.y[i + 1]; } T.n--; }

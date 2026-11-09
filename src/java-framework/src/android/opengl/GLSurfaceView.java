@@ -21,21 +21,22 @@ public class GLSurfaceView extends android.view.SurfaceView implements android.v
     private int version = 1, renderMode = RENDERMODE_CONTINUOUSLY;
     private boolean versionSet;
     private EGLContextFactory contextFactory;
-    private volatile boolean dirty = true, started, paused;
+    private volatile boolean dirty = true, started, paused, surfaceAvailable;
     private final ArrayList<Runnable> queue = new ArrayList<>();
 
     public GLSurfaceView(android.content.Context c) { this(c, null); }
     public GLSurfaceView(android.content.Context c, android.util.AttributeSet a) { super(c, a); getHolder().addCallback(this); }
-    public void surfaceCreated(android.view.SurfaceHolder h) { android.util.Log.d("RenderDiag", "surface-created " + getClass().getName()); start(); }
+    public void surfaceCreated(android.view.SurfaceHolder h) { android.util.Log.d("RenderDiag", "surface-created " + getClass().getName()); synchronized (this) { surfaceAvailable = true; } start(); }
     /** A new size for the surface (the view was laid out again: bars hidden, rotated): the GL thread tells the renderer. */
-    public void surfaceChanged(android.view.SurfaceHolder h, int format, int w, int ht) { if (w > 0 && ht > 0) { resized = ((long) w << 32) | ht; requestRender(); } }
-    private volatile long resized;
+    public void surfaceChanged(android.view.SurfaceHolder h, int format, int w, int ht) { if (w > 0 && ht > 0) { synchronized (this) { if (!surfaceAvailable) return; resized.put(w, ht); } requestRender(); } }
+    private final ResizeMailbox resized = new ResizeMailbox();
     /** @hide Husk's GL thread: the size to give onSurfaceChanged, once (0: none new). */
-    public final long huskTakeResize() { long r = resized; resized = 0; return r; }
-    public void surfaceDestroyed(android.view.SurfaceHolder h) { android.util.Log.d("RenderDiag", "surface-destroyed " + getClass().getName()); }
+    public final long huskTakeResize() { return resized.take(); }
+    public final boolean huskHasSurface() { synchronized (this) { return surfaceAvailable; } }
+    public void surfaceDestroyed(android.view.SurfaceHolder h) { synchronized (this) { surfaceAvailable = false; resized.take(); } android.util.Log.d("RenderDiag", "surface-destroyed " + getClass().getName()); }
     public void surfaceRedrawNeeded(android.view.SurfaceHolder h) { requestRender(); }
     public void surfaceRedrawNeededAsync(android.view.SurfaceHolder h, Runnable done) { requestRender(); done.run(); }
-    public void setRenderer(Renderer r) { renderer = r; if (isAttachedToWindow()) start(); }
+    public void setRenderer(Renderer r) { synchronized (this) { renderer = r; } start(); }
     public void setEGLContextClientVersion(int v) { version = v; versionSet = true; }
     public void setEGLConfigChooser(EGLConfigChooser c) {}
     public void setEGLConfigChooser(boolean depth) {}
@@ -53,10 +54,14 @@ public class GLSurfaceView extends android.view.SurfaceView implements android.v
     public void onPause() { paused = true; }
     public void onResume() { paused = false; dirty = true; }
     public void queueEvent(Runnable r) { synchronized (queue) { queue.add(r); } husk.Native.requestRender(); }
-    @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); start(); }
+    @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); }
     private void start() {
-        if (renderer == null || started) return;
-        started = true;
+        Renderer r;
+        synchronized (this) {
+            if (renderer == null || started || !surfaceAvailable) return;
+            started = true;
+            r = renderer;
+        }
         // an app with its own context factory asks for its GL ES version there (EGL_CONTEXT_CLIENT_VERSION), not here
         if (!versionSet && contextFactory != null) {
             try {
@@ -73,7 +78,10 @@ public class GLSurfaceView extends android.view.SurfaceView implements android.v
                 version = 2;
             }
         }
-        husk.Native.startGL(this, renderer, version);
+        synchronized (this) {
+            if (!surfaceAvailable) { started = false; return; }
+            husk.Native.startGL(this, r, version);
+        }
     }
 
     private static HuskGL10 sGL;

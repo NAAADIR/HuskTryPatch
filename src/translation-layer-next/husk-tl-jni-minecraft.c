@@ -368,6 +368,7 @@ static void XAL_randomBytes(tl_jcall *c)
 {
     int n = c->args[0].i;
     jobj *a = tl_jni_new_prim_array('B', (uint32_t)(n > 0 ? n : 0));
+    if (!a) return;
     if (n > 0) arc4random_buf(a->arr.data, (size_t)n);
     c->ret = vl(a);
 }

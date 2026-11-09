@@ -31,6 +31,8 @@
 #include "husk-tl-perm.h"
 #include "husk-tl-web-rect.h"
 #include "husk-tl-render-diag.h"
+#include "husk-tl-surface-size.h"
+#include "husk-tl-current.h"
 
 void tl_nwindow_configure(int w, int h, void *layer);
 void *tl_nwindow_get(void);
@@ -39,7 +41,7 @@ static struct {
     tl_javaapp_config cfg;
     char apk[1024], data[512], ext[512], pkg[200], activity[260], application[260], frame_dir[512], angle_egl[600], angle_gles[600];
     pthread_mutex_t q_lock;
-    int32_t q[4096]; int qn;                    /* packed input events: phase, id, x bits, y bits */
+    int32_t q[4100]; int qn;                    /* 4096 normal slots plus one reserved resize event */
     atomic_ulong frames;
     atomic_bool ended, paused, render_requested;
     jobj *gl_view, *gl_renderer;
@@ -53,6 +55,7 @@ static struct {
     char **text; int ntext, ctext;              /* typed text waiting for Native.pollText: "t<text>", "d", "e", "h" */
     int insets[5];                              /* left, top, right, bottom, keyboard */
 } A = { .q_lock = PTHREAD_MUTEX_INITIALIZER, .t_lock = PTHREAD_MUTEX_INITIALIZER };
+static tl_surface_size g_screen_size;
 
 static jvalue L(void *p) { jvalue v; v.j = 0; v.l = p; return v; }
 static jvalue I(int32_t i) { jvalue v; v.j = (uint32_t)i; return v; }
@@ -218,6 +221,7 @@ NAT(N_readAsset)
     const uint8_t *d; size_t len; bool owned; char err[160];
     if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &len, &owned, err, sizeof(err))) { *ret = L(NULL); return true; }
     jobj *arr = tl_jni_new_prim_array('B', (uint32_t)len);
+    if (!arr || !arr->arr.data) { free(arr); if (owned) free((void *)d); return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "asset array allocation failed"); }
     arr->refs = 1u << 30;
     memcpy(arr->arr.data, d, len);
     if (owned) free((void *)d);
@@ -248,6 +252,7 @@ NAT(N_listAssets)
         }
     }
     jobj *arr = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), (uint32_t)n);
+    if (!arr || !arr->oarr.v) { free(arr); for (int i = 0; i < n; i++) free(names[i]); free(names); return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "asset list allocation failed"); }
     arr->cls = tl_jni_class("[Ljava/lang/String;");
     arr->refs = 1u << 30;
     for (int i = 0; i < n; i++) { arr->oarr.v[i] = jstr(names[i]); free(names[i]); }
@@ -272,8 +277,9 @@ NAT(N_assetLength) { (void)self; const tl_zip_entry *e = asset_find(tl_jni_strin
 NAT(N_dataDir) { (void)self; (void)a; *ret = L(jstr(A.data)); return true; }
 NAT(N_externalDir) { (void)self; (void)a; *ret = L(jstr(A.ext)); return true; }
 NAT(N_packageName) { (void)self; (void)a; *ret = L(jstr(A.pkg)); return true; }
-NAT(N_screenWidth) { (void)self; (void)a; *ret = I(A.cfg.width); return true; }
-NAT(N_screenHeight) { (void)self; (void)a; *ret = I(A.cfg.height); return true; }
+NAT(N_screenWidth) { (void)self; (void)a; int w, h; tl_surface_load(&g_screen_size, &w, &h); *ret = I(w); return true; }
+NAT(N_screenHeight) { (void)self; (void)a; int w, h; tl_surface_load(&g_screen_size, &w, &h); *ret = I(h); return true; }
+NAT(N_screenSize) { (void)self; (void)a; *ret = J((int64_t)atomic_load_explicit(&g_screen_size, memory_order_acquire)); return true; }
 NAT(N_density) { (void)self; (void)a; *ret = F(A.cfg.density > 0 ? A.cfg.density : 3.0f); return true; }
 NAT(N_requestRender) { (void)self; (void)a; (void)ret; atomic_store(&A.render_requested, true); return true; }
 NAT(N_setContentView) { (void)self; (void)ret; A.content = a[0].l; return true; }
@@ -353,7 +359,12 @@ NAT(N_pollInput)
     pthread_mutex_lock(&A.q_lock);
     int n = A.qn / 4;
     if (!n) { pthread_mutex_unlock(&A.q_lock); *ret = L(NULL); return true; }
-    jobj *arr = tl_jni_new_prim_array('I', (uint32_t)(1 + A.qn));
+    jobj *arr = tl_jni_try_new_prim_array('I', (uint32_t)(1 + A.qn));
+    if (!arr || !arr->arr.data) {
+        free(arr);
+        pthread_mutex_unlock(&A.q_lock);
+        return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "input queue allocation failed");
+    }
     arr->refs = 1u << 30;
     int32_t *v = arr->arr.data;
     v[0] = n;
@@ -403,6 +414,7 @@ NAT(N_splitPaths)
     int n = 0;
     while (n < 16 && tl_ld_queued_split(n)) n++;
     jobj *arr = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), (uint32_t)n);
+    if (!arr || !arr->oarr.v) { free(arr); return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "split path array allocation failed"); }
     arr->cls = tl_jni_class("[Ljava/lang/String;");
     arr->refs = 1u << 30;
     for (int i = 0; i < n; i++) arr->oarr.v[i] = jstr(tl_ld_queued_split(i));
@@ -419,6 +431,7 @@ NAT(N_readApkFile)
     const uint8_t *d; size_t len; bool owned; char err[160];
     if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &len, &owned, err, sizeof(err))) { *ret = L(NULL); return true; }
     jobj *arr = tl_jni_new_prim_array('B', (uint32_t)len);
+    if (!arr || !arr->arr.data) { free(arr); if (owned) free((void *)d); return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "APK file array allocation failed"); }
     arr->refs = 1u << 30;
     memcpy(arr->arr.data, d, len);
     if (owned) free((void *)d);
@@ -482,6 +495,7 @@ NAT(N_pollText)
     int n = A.ntext;
     if (!n) { pthread_mutex_unlock(&A.t_lock); *ret = L(NULL); return true; }
     jobj *arr = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), (uint32_t)n);
+    if (!arr || !arr->oarr.v) { free(arr); pthread_mutex_unlock(&A.t_lock); return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "text queue allocation failed"); }
     arr->cls = tl_jni_class("[Ljava/lang/String;");
     arr->refs = 1u << 30;
     for (int i = 0; i < n; i++) { arr->oarr.v[i] = jstr(A.text[i]); free(A.text[i]); }
@@ -520,6 +534,7 @@ NAT(N_insets)
 {
     (void)self; (void)a;
     jobj *arr = tl_jni_new_prim_array('I', 5);
+    if (!arr || !arr->arr.data) { free(arr); return tl_jni_pending() ? false : dvm_throw("java/lang/OutOfMemoryError", "insets array allocation failed"); }
     arr->refs = 1u << 30;
     memcpy(arr->arr.data, A.insets, sizeof(A.insets));
     *ret = L(arr);
@@ -551,6 +566,7 @@ static const struct { const char *name, *sig; dvm_native_fn fn; } k_native[] = {
     { "packageName", "()Ljava/lang/String;", N_packageName },
     { "screenWidth", "()I", N_screenWidth },
     { "screenHeight", "()I", N_screenHeight },
+    { "screenSize", "()J", N_screenSize },
     { "density", "()F", N_density },
     { "startGL", "(Ljava/lang/Object;Ljava/lang/Object;I)V", N_startGL },
     { "requestRender", "()V", N_requestRender },
@@ -989,12 +1005,23 @@ void tl_javaapp_app_pixels(const void *px, int w, int h)
     if (E2.pw != w || E2.ph != h || !E2.px) E2.px = realloc(E2.px, n);
     if (E2.px) memcpy(E2.px, px, n);
     E2.pw = w; E2.ph = h; E2.tex = 0;
-    E2.x = 0; E2.y = 0; E2.w = A.cfg.width; E2.h = A.cfg.height;
+    E2.x = 0; E2.y = 0; tl_surface_load(&g_screen_size, &E2.w, &E2.h);
     E2.on = true; E2.seq++;
     pthread_mutex_unlock(&E2.lk);
 }
 static uint64_t app_frame_seq(void) { pthread_mutex_lock(&E2.lk); uint64_t q = E2.seq; pthread_mutex_unlock(&E2.lk); return q; }
 static bool app_frame_on(void) { pthread_mutex_lock(&E2.lk); bool q = E2.on; pthread_mutex_unlock(&E2.lk); return q; }
+
+/* These are boundary snapshots; the renderer may change either value during a draw. */
+static void renderdiag_draw_state(const char *stage, unsigned long frame, EGLContext expected)
+{
+    EGLContext (*current)(void) = tl_egl_resolve("eglGetCurrentContext");
+    void (*get)(uint32_t, int32_t *) = gl_fn("glGetIntegerv");
+    EGLContext actual = current ? current() : NULL;
+    int32_t vp[4] = {-1, -1, -1, -1};
+    if (current && actual && get) get(0x0BA2, vp);
+    tl_log_line("renderdiag: draw-state stage=%s frame=%lu expected=%p current=%p current-query=%d viewport=%d,%d,%d,%d", stage, frame, expected, actual, current != NULL, vp[0], vp[1], vp[2], vp[3]);
+}
 
 /* Reads only the currently bound default framebuffer. Never consume the
  * game's GL errors or change its bindings. Readback can stall the GPU. */
@@ -1053,7 +1080,7 @@ static void *gl_main(void *arg)
     if (surf && querySurface) { sw_ok = querySurface(dpy, surf, 0x3057, &sw); sh_ok = querySurface(dpy, surf, 0x3056, &sh); }
     tl_log_line("renderdiag: host-create thread=%p ui=%p surface=%p surface-size=%dx%d drawable-presentation=unverified", (void *)pthread_self(), ui, surf, sw, sh);
     if (!sw_ok || !sh_ok) tl_log_line("renderdiag: surface-query-failed surface=%p width=%u height=%u", surf, sw_ok, sh_ok);
-    if (!ui || !surf || !makeCurrent(dpy, surf, surf, ui)) { tl_log_line("javaapp: no GL context"); return NULL; }
+    if (!ui || !surf || !tl_checked_current(makeCurrent, dpy, surf, ui, &A.ended)) { tl_log_line("javaapp: no GL context"); atomic_store(&A.ended, true); return NULL; }
     if (swapInterval) swapInterval(dpy, 1);
     overlay ov = { 0 }, appov = { 0 }, appup = { 0 };
     ov_init(&ov);
@@ -1067,18 +1094,27 @@ static void *gl_main(void *arg)
     uint64_t app_seq = 0;
     void (*clearColor)(float, float, float, float) = gl_fn("glClearColor");
     void (*clear)(uint32_t) = gl_fn("glClear");
-    tl_log_line("javaapp: render thread ready (ES %d available), %dx%d", es3 ? 3 : 2, A.cfg.width, A.cfg.height);
+    int screen_w, screen_h;
+    tl_surface_load(&g_screen_size, &screen_w, &screen_h);
+    tl_log_line("javaapp: render thread ready (ES %d available), %dx%d", es3 ? 3 : 2, screen_w, screen_h);
 
     jobj *gl10 = NULL;
     jvalue p1[1];
-    int gl_w = 0, gl_h = 0, app_es = 0;   /* the size the renderer was last told */
+    int gl_w = 0, gl_h = 0, app_es = 0;   /* the view size the renderer was last told */
     bool first_draw = true;
     int64_t next = now_ns();
     while (!atomic_load(&A.ended)) {
         if (atomic_load(&A.paused)) { usleep(20000); next = now_ns(); continue; }
+        tl_surface_load(&g_screen_size, &screen_w, &screen_h);
         bool drew = false;
         /* the app's renderer, once its GLSurfaceView is on screen */
-        if (__atomic_load_n(&A.gl_renderer, __ATOMIC_ACQUIRE) && !app) {
+        bool create_app = __atomic_load_n(&A.gl_renderer, __ATOMIC_ACQUIRE) && !app;
+        if (create_app) {
+            jvalue available = tl_jni_call(A.gl_view, "huskHasSurface", "()Z", NULL);
+            if (tl_jni_pending()) log_pending("huskHasSurface");
+            create_app = available.z;
+        }
+        if (create_app) {
             /* GLSurfaceView's default is OpenGL ES 1 (fixed function, through ANGLE's ES1 front end); 2 and 3 as asked */
             int es = A.gl_version >= 3 && es3 ? 3 : A.gl_version <= 1 ? 1 : 2;
             const EGLint attr[] = { 0x3098, es, EGL_NONE };
@@ -1089,7 +1125,7 @@ static void *gl_main(void *arg)
                 const EGLint attr2[] = { 0x3098, 2, EGL_NONE };
                 app = createContext(dpy, cfg, NULL, attr2);
             }
-            if (!app || !makeCurrent(dpy, surf, surf, app)) { tl_log_line("javaapp: no GL ES %d context for the app", es); A.gl_renderer = NULL; app = NULL; }
+            if (!app || !tl_checked_current(makeCurrent, dpy, surf, app, &A.ended)) { tl_log_line("javaapp: no GL ES %d context for the app", es); atomic_store(&A.ended, true); break; }
             else {
                 app_es = es;
                 tl_log_line("renderdiag: route=host-glsurfaceview thread=%p app=%p ui=%p surface=%p es=%d", (void *)pthread_self(), app, ui, surf, es);
@@ -1102,82 +1138,76 @@ static void *gl_main(void *arg)
                 jvalue p2[2] = { L(gl10), L(eglcfg) };
                 tl_jni_call(A.gl_renderer, "onSurfaceCreated", "(Ljavax/microedition/khronos/opengles/GL10;Ljavax/microedition/khronos/egl/EGLConfig;)V", p2);
                 if (tl_jni_pending()) log_pending("onSurfaceCreated");
-                jvalue p3[3] = { L(gl10), I(A.cfg.width), I(A.cfg.height) };
-                tl_jni_call(A.gl_renderer, "onSurfaceChanged", "(Ljavax/microedition/khronos/opengles/GL10;II)V", p3);
-                if (tl_jni_pending()) log_pending("onSurfaceChanged");
-                gl_w = A.cfg.width; gl_h = A.cfg.height;
                 p1[0] = L(gl10);
             }
-        }
-        /* HuskPatch: the window was resized (tl_javaapp_resize): tell the renderer, as GLSurfaceView does when its surface
-         * changes, so it draws at the new size instead of the old one. */
-        if (app && (A.cfg.width != gl_w || A.cfg.height != gl_h)) {
-            gl_w = A.cfg.width; gl_h = A.cfg.height;
-            if (!makeCurrent(dpy, surf, surf, app)) tl_log_line("renderdiag: make-current-failed stage=resize thread=%p context=%p surface=%p", (void *)pthread_self(), app, surf);
-            jvalue p3[3] = { L(gl10), I(gl_w), I(gl_h) };
-            tl_jni_call(A.gl_renderer, "onSurfaceChanged", "(Ljavax/microedition/khronos/opengles/GL10;II)V", p3);
-            if (tl_jni_pending()) log_pending("onSurfaceChanged (resized)");
-            tl_log_line("javaapp: resized to %dx%d", gl_w, gl_h);
-            atomic_store(&A.render_requested, true);
         }
         const uint8_t *px; int fw, fh; bool any;
         bool fresh = tl_ui_frame_take(&px, &fw, &fh, &any);
         if (fresh) {
-            if (!makeCurrent(dpy, surf, surf, ui)) tl_log_line("renderdiag: make-current-failed stage=upload thread=%p context=%p surface=%p", (void *)pthread_self(), ui, surf);
+            if (!tl_checked_current(makeCurrent, dpy, surf, ui, &A.ended)) { tl_log_line("renderdiag: make-current-failed stage=upload thread=%p context=%p surface=%p", (void *)pthread_self(), ui, surf); tl_ui_frame_done(); atomic_store(&A.ended, true); break; }
             if (any) ov_upload(&ov, px, fw, fh);
             else ov.tw = ov.th = 0;
             tl_ui_frame_done();
         }
         if (app) {
-            if (!makeCurrent(dpy, surf, surf, app)) tl_log_line("renderdiag: make-current-failed stage=draw thread=%p context=%p surface=%p", (void *)pthread_self(), app, surf);
+            if (!tl_checked_current(makeCurrent, dpy, surf, app, &A.ended)) { tl_log_line("renderdiag: make-current-failed stage=draw thread=%p context=%p surface=%p", (void *)pthread_self(), app, surf); atomic_store(&A.ended, true); break; }
+            jvalue available = tl_jni_call(A.gl_view, "huskHasSurface", "()Z", NULL);
+            if (tl_jni_pending()) log_pending("huskHasSurface");
+            if (!available.z) { gl_w = gl_h = 0; }
+            else {
             jvalue draw = tl_jni_call(A.gl_view, "huskBeginFrame", "()Z", NULL);
             if (tl_jni_pending()) log_pending("a queued GL event");
             /* the view's surface changed size (laid out again: the app hid the bars, or turned): onSurfaceChanged again, as GLThread does */
             jvalue rs = tl_jni_call(A.gl_view, "huskTakeResize", "()J", NULL);
             if (tl_jni_pending()) log_pending("huskTakeResize");
             if (rs.j) {
-                jvalue p3[3] = { L(gl10), I((int)(rs.j >> 32)), I((int)(rs.j & 0xffffffff)) };
-                tl_log_line("javaapp: the GL view is now %dx%d", (int)(rs.j >> 32), (int)(rs.j & 0xffffffff));
+                gl_w = (int)(rs.j >> 32); gl_h = (int)(rs.j & 0xffffffff);
+                jvalue p3[3] = { L(gl10), I(gl_w), I(gl_h) };
+                tl_log_line("javaapp: the GL view is now %dx%d", gl_w, gl_h);
                 tl_jni_call(A.gl_renderer, "onSurfaceChanged", "(Ljavax/microedition/khronos/opengles/GL10;II)V", p3);
                 if (tl_jni_pending()) log_pending("onSurfaceChanged");
                 draw.z = true;
             }
             /* a new frame of views needs the scene under it again: what was swapped is gone */
-            if (draw.z || fresh || atomic_exchange(&A.render_requested, false)) {
+            if (gl_w > 0 && gl_h > 0 && (draw.z || fresh || atomic_exchange(&A.render_requested, false))) {
+                unsigned long df = atomic_load(&A.frames) + 1;
+                bool sample_game = app_es == 2 && !strcmp(A.pkg, "sg.gumi.bravefrontier") && tl_diag_sample_frame(df);
+                if (sample_game) renderdiag_draw_state("before", df, app);
                 tl_jni_call(A.gl_renderer, "onDrawFrame", "(Ljavax/microedition/khronos/opengles/GL10;)V", p1);
                 if (tl_jni_pending()) log_pending("onDrawFrame");
                 drew = true;
                 if (first_draw) { tl_log_line("renderdiag: first-draw thread=%p context=%p surface=%p gl-error=unverified", (void *)pthread_self(), app, surf); first_draw = false; }
-                unsigned long df = atomic_load(&A.frames) + 1;
-                if (app_es == 2 && !strcmp(A.pkg, "sg.gumi.bravefrontier") && tl_diag_sample_frame(df)) {
+                if (sample_game) {
+                    renderdiag_draw_state("after", df, app);
                     if (querySurface) { querySurface(dpy, surf, 0x3057, &sw); querySurface(dpy, surf, 0x3056, &sh); }
                     renderdiag_sample("game", df, sw, sh);
                 }
+            }
             }
         }
         uint64_t q = app_frame_seq();
         bool app_fresh = q != app_seq;
         app_seq = q;
         if (drew || fresh || app_fresh) {
-            if (!makeCurrent(dpy, surf, surf, ui)) tl_log_line("renderdiag: make-current-failed stage=compose thread=%p context=%p surface=%p", (void *)pthread_self(), ui, surf);
+            if (!tl_checked_current(makeCurrent, dpy, surf, ui, &A.ended)) { tl_log_line("renderdiag: make-current-failed stage=compose thread=%p context=%p surface=%p", (void *)pthread_self(), ui, surf); atomic_store(&A.ended, true); break; }
             if (!app) { clearColor(0, 0, 0, tl_web_any_visible() && !app_frame_on() ? 0 : 1); clear(0x4000); }     /* web views show through from under the screen */
-            if (!app) app_frame_draw(&appov, &appup, A.cfg.width, A.cfg.height);
+            if (!app) app_frame_draw(&appov, &appup, screen_w, screen_h);
             unsigned long frame = atomic_load(&A.frames) + 1;
-            if ((frame == 1 || frame == 120 || frame == 600 || frame % 1800 == 0) && A.cfg.width > 0 && A.cfg.height > 0) {
+            if ((frame == 1 || frame == 120 || frame == 600 || frame % 1800 == 0) && screen_w > 0 && screen_h > 0) {
                 void (*readPixels)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void *) = gl_fn("glReadPixels");
                 uint8_t px[4] = {0};
-                if (readPixels) readPixels(A.cfg.width / 2, A.cfg.height / 2, 1, 1, 0x1908, 0x1401, px);
+                if (readPixels) readPixels(screen_w / 2, screen_h / 2, 1, 1, 0x1908, 0x1401, px);
                 tl_log_line("javaapp: frame=%lu game center rgba=%u,%u,%u,%u", frame, px[0], px[1], px[2], px[3]);
             }
-            int holes = web_clear_holes(A.cfg.width, A.cfg.height);
-            if (tl_ui_has_frame()) ov_draw(&ov, A.cfg.width, A.cfg.height);
+            int holes = web_clear_holes(screen_w, screen_h);
+            if (tl_ui_has_frame()) ov_draw(&ov, screen_w, screen_h);
             if (app && app_es == 2 && !strcmp(A.pkg, "sg.gumi.bravefrontier") && tl_diag_sample_frame(frame)) renderdiag_sample("composed", frame, sw, sh);
             if (frame == 1 || frame == 120 || frame == 600 || frame % 1800 == 0) {
                 void (*readPixels)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void *) = gl_fn("glReadPixels");
                 int32_t fb = -1, viewport[4] = {0}; uint8_t px[4] = {0};
                 void (*getInt)(uint32_t, int32_t *) = gl_fn("glGetIntegerv");
                 if (getInt) { getInt(0x8CA6, &fb); getInt(0x0BA2, viewport); }
-                if (readPixels && A.cfg.width > 0 && A.cfg.height > 0) readPixels(A.cfg.width / 2, A.cfg.height / 2, 1, 1, 0x1908, 0x1401, px);
+                if (readPixels && screen_w > 0 && screen_h > 0) readPixels(screen_w / 2, screen_h / 2, 1, 1, 0x1908, 0x1401, px);
                 tl_log_line("javaapp: frame=%lu composed center rgba=%u,%u,%u,%u fb=%d viewport=%d,%d,%d,%d webholes=%d app=%d ui=%d", frame, px[0], px[1], px[2], px[3], fb, viewport[0], viewport[1], viewport[2], viewport[3], holes, app != NULL, tl_ui_has_frame());
             }
             unsigned swapped = swapBuffers(dpy, surf);
@@ -1341,6 +1371,7 @@ bool tl_javaapp_start(const tl_javaapp_config *cfg)
     /* stores into a library's executable view (data sharing a page with its code, as Unity's does) go through the writable one */
     { void tl_codewrite_enable(void); tl_codewrite_enable(); }
     A.cfg = *cfg;
+    atomic_store_explicit(&g_screen_size, tl_surface_pack(cfg->width, cfg->height), memory_order_release);
     snprintf(A.apk, sizeof(A.apk), "%s", cfg->apk_path);
     /* JIT-less mode: LuaJIT (LÖVE games) runs its interpreter, as the SDL driver already has it do */
     if (getenv("TL_NO_XMEM")) { void tl_luajit_interpreter_only(void); tl_luajit_interpreter_only(); }
@@ -1420,15 +1451,19 @@ unsigned long tl_javaapp_frames(void) { return atomic_load(&A.frames); }
 bool tl_javaapp_ended(void) { return atomic_load(&A.ended); }
 void tl_javaapp_finish(void) { atomic_store(&A.ended, true); }
 
-/* HuskPatch: the app's window changed size (a resizable window over Husk). The view system reads the screen's size from
- * A.cfg on every layout, so it relays out at the new size, as an Android window does when it is resized; the frame
+/* HuskPatch: the app's window changed size (a resizable window over Husk). The view system reads the published screen size
+ * on every layout, so it relays out at the new size, as an Android window does when it is resized; the frame
  * buffers follow whatever size is drawn (G_present). Phase 10 tells the Java side to lay out again. */
 void tl_javaapp_resize(int w, int h)
 {
-    if (w <= 0 || h <= 0 || (w == A.cfg.width && h == A.cfg.height)) return;
+    if (w <= 0 || h <= 0) return;
     pthread_mutex_lock(&E2.lk);
-    A.cfg.width = w; A.cfg.height = h;
+    /* Serialize publication and notification. Normal producers stop at 4096,
+     * leaving one extra event for a resize even when the queue is full. */
+    pthread_mutex_lock(&A.q_lock);
+    if (!tl_surface_update(&g_screen_size, w, h)) { pthread_mutex_unlock(&A.q_lock); pthread_mutex_unlock(&E2.lk); return; }
     E2.w = w; E2.h = h;
+    if (A.qn < 4100) { A.q[A.qn++] = 10; A.q[A.qn++] = 0; A.q[A.qn++] = 0; A.q[A.qn++] = 0; }
+    pthread_mutex_unlock(&A.q_lock);
     pthread_mutex_unlock(&E2.lk);
-    tl_javaapp_touch(10, 0, 0, 0);
 }
