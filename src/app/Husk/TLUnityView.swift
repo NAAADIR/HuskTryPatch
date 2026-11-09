@@ -253,8 +253,14 @@ final class TLUnityUIView: UIView, UIKeyInput {
 
     private var firstLayout: Date?
 
+    private func logRenderLayer(_ event: String) {
+        guard engine == .java, let metal = layer as? CAMetalLayer else { return }
+        HuskLog.log("tl", "renderdiag: layer event=\(event) attached=\(window != nil) superlayer=\(metal.superlayer != nil) hidden=\(isHidden || metal.isHidden) alpha=\(alpha) opacity=\(metal.opacity) bounds=\(bounds) drawable=\(metal.drawableSize) presentation=unverified")
+    }
+
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        logRenderLayer("didMoveToWindow")
         statsTimer?.invalidate()
         statsTimer = nil
         if window != nil {
@@ -268,6 +274,7 @@ final class TLUnityUIView: UIView, UIKeyInput {
     }
 
     private func launch(width: Int, height: Int) {
+        logRenderLayer("launch")
         launched = true
         launchedSize = bounds.size
         let angle = (Bundle.main.privateFrameworksPath ?? "") + "/libANGLE-shared.dylib"

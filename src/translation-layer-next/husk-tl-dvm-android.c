@@ -30,6 +30,7 @@
 #include "husk-tl-docs.h"
 #include "husk-tl-perm.h"
 #include "husk-tl-web-rect.h"
+#include "husk-tl-render-diag.h"
 
 void tl_nwindow_configure(int w, int h, void *layer);
 void *tl_nwindow_get(void);
@@ -531,6 +532,7 @@ NAT(N_startGL)
     void tl_thread_altstack(void); tl_thread_altstack();
     (void)self; (void)ret;
     if (A.gl_started) return true;
+    tl_log_line("renderdiag: renderer-register thread=%p view=%p renderer=%p es=%d", (void *)pthread_self(), a[0].l, a[1].l, a[2].i);
     A.gl_version = a[2].i; A.gl_view = a[0].l;
     A.gl_started = true;
     /* the render thread picks it up; released after the version and view, so it never sees the renderer without them */
@@ -804,6 +806,7 @@ NAT(EN_createContext)
     }
     if (!c->c) { tl_log_line("egl: no ES %d context for the app's thread", v); free(c); return true; }
     c->version = v;
+    tl_log_line("renderdiag: route=%s thread=%p context=%p requested-share=%s", c->readback ? "java-egl-pixel-readback" : "java-egl-shared-texture", (void *)pthread_self(), c->c, share && share->c ? "explicit" : "host-ui");
     tl_log_line("egl: the app made an ES %d context on its own thread%s", v, c->readback ? " (frames read back)" : "");
     ret->j = (int64_t)(uintptr_t)c;
     return true;
@@ -813,6 +816,7 @@ NAT(EN_destroyContext)
     (void)self; (void)ret;
     app_ctx *c = (app_ctx *)(uintptr_t)a[0].j;
     if (!c) return true;
+    tl_log_line("renderdiag: java-egl-context-destroy thread=%p context=%p", (void *)pthread_self(), c->c);
     unsigned (*destroy)(EGLDisplay, EGLContext) = tl_egl_resolve("eglDestroyContext");
     if (destroy) destroy(E2.dpy, c->c);
     free(c);
@@ -830,6 +834,7 @@ NAT(EN_createSurface)
     if (!pb) { tl_log_line("egl: no %dx%d surface for the app", w, h); return true; }
     app_surf *s = calloc(1, sizeof(*s));
     s->pb = pb; s->w = w; s->h = h;
+    tl_log_line("renderdiag: java-egl-pbuffer-create thread=%p surface=%p size=%dx%d", (void *)pthread_self(), pb, w, h);
     ret->j = (int64_t)(uintptr_t)s;
     return true;
 }
@@ -838,6 +843,7 @@ NAT(EN_destroySurface)
     (void)self; (void)ret;
     app_surf *s = (app_surf *)(uintptr_t)a[0].j;
     if (!s) return true;
+    tl_log_line("renderdiag: java-egl-pbuffer-destroy thread=%p surface=%p", (void *)pthread_self(), s->pb);
     unsigned (*destroy)(EGLDisplay, EGLSurface) = tl_egl_resolve("eglDestroySurface");
     pthread_mutex_lock(&E2.lk);
     if (E2.on && (E2.tex == s->tex[0] || E2.tex == s->tex[1])) { E2.on = false; E2.seq++; }
@@ -990,6 +996,26 @@ void tl_javaapp_app_pixels(const void *px, int w, int h)
 static uint64_t app_frame_seq(void) { pthread_mutex_lock(&E2.lk); uint64_t q = E2.seq; pthread_mutex_unlock(&E2.lk); return q; }
 static bool app_frame_on(void) { pthread_mutex_lock(&E2.lk); bool q = E2.on; pthread_mutex_unlock(&E2.lk); return q; }
 
+/* Reads only the currently bound default framebuffer. Never consume the
+ * game's GL errors or change its bindings. Readback can stall the GPU. */
+static void renderdiag_sample(const char *stage, unsigned long frame, int w, int h)
+{
+    void (*get)(uint32_t, int32_t *) = gl_fn("glGetIntegerv");
+    void (*read)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void *) = gl_fn("glReadPixels");
+    int32_t fb = -1, vp[4] = {0}, pack = -1; int points[5][2];
+    if (!get || !read || !tl_diag_points(w, h, points)) {
+        tl_log_line("renderdiag: sample stage=%s frame=%lu valid=0 reason=unavailable size=%dx%d", stage, frame, w, h); return;
+    }
+    get(0x8CA6, &fb); get(0x0BA2, vp); get(0x0D05, &pack);
+    if (fb != 0) {
+        tl_log_line("renderdiag: sample stage=%s frame=%lu valid=0 reason=nondefault-fbo fb=%d viewport=%d,%d,%d,%d size=%dx%d pack=%d", stage, frame, fb, vp[0], vp[1], vp[2], vp[3], w, h, pack); return;
+    }
+    unsigned char px[5][4]; memset(px, 0xff, sizeof(px));
+    for (int i = 0; i < 5; i++) read(points[i][0], points[i][1], 1, 1, 0x1908, 0x1401, px[i]);
+    /* Success cannot be verified without consuming GL errors. */
+    tl_log_line("renderdiag: sample stage=%s frame=%lu valid=unverified fb=%d viewport=%d,%d,%d,%d size=%dx%d pack=%d rgba=%u,%u,%u,%u/%u,%u,%u,%u/%u,%u,%u,%u/%u,%u,%u,%u/%u,%u,%u,%u", stage, frame, fb, vp[0], vp[1], vp[2], vp[3], w, h, pack, px[0][0],px[0][1],px[0][2],px[0][3],px[1][0],px[1][1],px[1][2],px[1][3],px[2][0],px[2][1],px[2][2],px[2][3],px[3][0],px[3][1],px[3][2],px[3][3],px[4][0],px[4][1],px[4][2],px[4][3]);
+}
+
 /*
  * The render thread: one EGL surface on the app's screen, and on it, each frame, what the app's GLSurfaceView renderer draws (in
  * the app's own context) with the window's views over it (in Husk's). An app without GL still gets this thread for its views.
@@ -1010,8 +1036,9 @@ static void *gl_main(void *arg)
     if (!getDisplay || !createWindowSurface || !swapBuffers) { tl_log_line("javaapp: EGL is not available"); return NULL; }
     EGLDisplay dpy = getDisplay(NULL);
     EGLint major = 0, minor = 0;
-    initialize(dpy, &major, &minor);
-    bindAPI(0x30A0);
+    unsigned init_ok = initialize(dpy, &major, &minor);
+    unsigned api_ok = bindAPI(0x30A0);
+    tl_log_line("renderdiag: egl-init thread=%p display=%p initialize=%u version=%d.%d bind-api=%u", (void *)pthread_self(), dpy, init_ok, major, minor, api_ok);
     EGLConfig cfg = NULL; EGLint ncfg = 0;
     const EGLint want3[] = { 0x3040, 0x40, 0x3033, 0x5, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, EGL_NONE };
     const EGLint want2[] = { 0x3040, 0x4, 0x3033, 0x5, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, EGL_NONE };
@@ -1020,6 +1047,12 @@ static void *gl_main(void *arg)
     const EGLint ui_attr[] = { 0x3098, 2, EGL_NONE };
     EGLContext ui = createContext(dpy, cfg, NULL, ui_attr), app = NULL;
     EGLSurface surf = createWindowSurface(dpy, cfg, tl_nwindow_get(), NULL);
+    EGLint sw = 0, sh = 0;
+    unsigned (*querySurface)(EGLDisplay, EGLSurface, EGLint, EGLint *) = tl_egl_resolve("eglQuerySurface");
+    unsigned sw_ok = 0, sh_ok = 0;
+    if (surf && querySurface) { sw_ok = querySurface(dpy, surf, 0x3057, &sw); sh_ok = querySurface(dpy, surf, 0x3056, &sh); }
+    tl_log_line("renderdiag: host-create thread=%p ui=%p surface=%p surface-size=%dx%d drawable-presentation=unverified", (void *)pthread_self(), ui, surf, sw, sh);
+    if (!sw_ok || !sh_ok) tl_log_line("renderdiag: surface-query-failed surface=%p width=%u height=%u", surf, sw_ok, sh_ok);
     if (!ui || !surf || !makeCurrent(dpy, surf, surf, ui)) { tl_log_line("javaapp: no GL context"); return NULL; }
     if (swapInterval) swapInterval(dpy, 1);
     overlay ov = { 0 }, appov = { 0 }, appup = { 0 };
@@ -1038,7 +1071,8 @@ static void *gl_main(void *arg)
 
     jobj *gl10 = NULL;
     jvalue p1[1];
-    int gl_w = 0, gl_h = 0;   /* HuskPatch: the size the app's renderer was last told (onSurfaceChanged) */
+    int gl_w = 0, gl_h = 0, app_es = 0;   /* the size the renderer was last told */
+    bool first_draw = true;
     int64_t next = now_ns();
     while (!atomic_load(&A.ended)) {
         if (atomic_load(&A.paused)) { usleep(20000); next = now_ns(); continue; }
@@ -1057,6 +1091,8 @@ static void *gl_main(void *arg)
             }
             if (!app || !makeCurrent(dpy, surf, surf, app)) { tl_log_line("javaapp: no GL ES %d context for the app", es); A.gl_renderer = NULL; app = NULL; }
             else {
+                app_es = es;
+                tl_log_line("renderdiag: route=host-glsurfaceview thread=%p app=%p ui=%p surface=%p es=%d", (void *)pthread_self(), app, ui, surf, es);
                 tl_log_line("javaapp: the app's GL ES %d context is ready", es);
                 gl10 = dvm_new_object(dvm_class_named("android/opengl/HuskGL10"));
                 dvm_slots(gl10);
@@ -1077,7 +1113,7 @@ static void *gl_main(void *arg)
          * changes, so it draws at the new size instead of the old one. */
         if (app && (A.cfg.width != gl_w || A.cfg.height != gl_h)) {
             gl_w = A.cfg.width; gl_h = A.cfg.height;
-            makeCurrent(dpy, surf, surf, app);
+            if (!makeCurrent(dpy, surf, surf, app)) tl_log_line("renderdiag: make-current-failed stage=resize thread=%p context=%p surface=%p", (void *)pthread_self(), app, surf);
             jvalue p3[3] = { L(gl10), I(gl_w), I(gl_h) };
             tl_jni_call(A.gl_renderer, "onSurfaceChanged", "(Ljavax/microedition/khronos/opengles/GL10;II)V", p3);
             if (tl_jni_pending()) log_pending("onSurfaceChanged (resized)");
@@ -1087,13 +1123,13 @@ static void *gl_main(void *arg)
         const uint8_t *px; int fw, fh; bool any;
         bool fresh = tl_ui_frame_take(&px, &fw, &fh, &any);
         if (fresh) {
-            makeCurrent(dpy, surf, surf, ui);
+            if (!makeCurrent(dpy, surf, surf, ui)) tl_log_line("renderdiag: make-current-failed stage=upload thread=%p context=%p surface=%p", (void *)pthread_self(), ui, surf);
             if (any) ov_upload(&ov, px, fw, fh);
             else ov.tw = ov.th = 0;
             tl_ui_frame_done();
         }
         if (app) {
-            makeCurrent(dpy, surf, surf, app);
+            if (!makeCurrent(dpy, surf, surf, app)) tl_log_line("renderdiag: make-current-failed stage=draw thread=%p context=%p surface=%p", (void *)pthread_self(), app, surf);
             jvalue draw = tl_jni_call(A.gl_view, "huskBeginFrame", "()Z", NULL);
             if (tl_jni_pending()) log_pending("a queued GL event");
             /* the view's surface changed size (laid out again: the app hid the bars, or turned): onSurfaceChanged again, as GLThread does */
@@ -1111,13 +1147,19 @@ static void *gl_main(void *arg)
                 tl_jni_call(A.gl_renderer, "onDrawFrame", "(Ljavax/microedition/khronos/opengles/GL10;)V", p1);
                 if (tl_jni_pending()) log_pending("onDrawFrame");
                 drew = true;
+                if (first_draw) { tl_log_line("renderdiag: first-draw thread=%p context=%p surface=%p gl-error=unverified", (void *)pthread_self(), app, surf); first_draw = false; }
+                unsigned long df = atomic_load(&A.frames) + 1;
+                if (app_es == 2 && !strcmp(A.pkg, "sg.gumi.bravefrontier") && tl_diag_sample_frame(df)) {
+                    if (querySurface) { querySurface(dpy, surf, 0x3057, &sw); querySurface(dpy, surf, 0x3056, &sh); }
+                    renderdiag_sample("game", df, sw, sh);
+                }
             }
         }
         uint64_t q = app_frame_seq();
         bool app_fresh = q != app_seq;
         app_seq = q;
         if (drew || fresh || app_fresh) {
-            makeCurrent(dpy, surf, surf, ui);
+            if (!makeCurrent(dpy, surf, surf, ui)) tl_log_line("renderdiag: make-current-failed stage=compose thread=%p context=%p surface=%p", (void *)pthread_self(), ui, surf);
             if (!app) { clearColor(0, 0, 0, tl_web_any_visible() && !app_frame_on() ? 0 : 1); clear(0x4000); }     /* web views show through from under the screen */
             if (!app) app_frame_draw(&appov, &appup, A.cfg.width, A.cfg.height);
             unsigned long frame = atomic_load(&A.frames) + 1;
@@ -1129,6 +1171,7 @@ static void *gl_main(void *arg)
             }
             int holes = web_clear_holes(A.cfg.width, A.cfg.height);
             if (tl_ui_has_frame()) ov_draw(&ov, A.cfg.width, A.cfg.height);
+            if (app && app_es == 2 && !strcmp(A.pkg, "sg.gumi.bravefrontier") && tl_diag_sample_frame(frame)) renderdiag_sample("composed", frame, sw, sh);
             if (frame == 1 || frame == 120 || frame == 600 || frame % 1800 == 0) {
                 void (*readPixels)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void *) = gl_fn("glReadPixels");
                 int32_t fb = -1, viewport[4] = {0}; uint8_t px[4] = {0};
@@ -1138,6 +1181,7 @@ static void *gl_main(void *arg)
                 tl_log_line("javaapp: frame=%lu composed center rgba=%u,%u,%u,%u fb=%d viewport=%d,%d,%d,%d webholes=%d app=%d ui=%d", frame, px[0], px[1], px[2], px[3], fb, viewport[0], viewport[1], viewport[2], viewport[3], holes, app != NULL, tl_ui_has_frame());
             }
             unsigned swapped = swapBuffers(dpy, surf);
+            if (frame == 1 || !swapped) tl_log_line("renderdiag: swap thread=%p frame=%lu surface=%p context=%p result=%u drawable-presentation=unverified", (void *)pthread_self(), frame, surf, ui, swapped);
             if (!swapped && (frame <= 3 || frame % 600 == 0)) tl_log_line("javaapp: EGL window swap failed at frame %lu", frame);
             atomic_fetch_add(&A.frames, 1);
         }

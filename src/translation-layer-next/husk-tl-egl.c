@@ -315,6 +315,7 @@ static EGLSurface w_eglCreateWindowSurface(EGLDisplay d, EGLConfig cfg, void *wi
             pthread_mutex_unlock(&g_tex_lock);
         }
         tl_log_line("egl: TextureView window %dx%d -> off-screen surface %p", pb[1], pb[3], s);
+        tl_log_line("renderdiag: route=textureview-pbuffer thread=%p surface=%p size=%dx%d", (void *)pthread_self(), s, pb[1], pb[3]);
         return s;
     }
     if (tl_javaapp_compositing && tl_javaapp_compositing()) {
@@ -326,6 +327,7 @@ static EGLSurface w_eglCreateWindowSurface(EGLDisplay d, EGLConfig cfg, void *wi
             pthread_mutex_unlock(&g_tex_lock);
         }
         tl_log_line("egl: window %dx%d -> surface %p, composited under the app's views", pb[1], pb[3], s);
+        tl_log_line("renderdiag: route=native-pbuffer-pixel-readback thread=%p surface=%p size=%dx%d", (void *)pthread_self(), s, pb[1], pb[3]);
         return s;
     }
     if (E.frame_dir[0] || g_offscreen_windows) {
@@ -344,11 +346,13 @@ static EGLSurface w_eglCreateWindowSurface(EGLDisplay d, EGLConfig cfg, void *wi
     }
     void *layer = tl_nwindow_native(win);
     EGLSurface s = a_eglCreateWindowSurface(d, cfg, layer, at);
+    tl_log_line("renderdiag: route=egl-direct-window thread=%p surface=%p layer=%p size=%dx%d", (void *)pthread_self(), s, layer, tl_nwindow_width(win), tl_nwindow_height(win));
     tl_log_line("egl: window surface %p on layer %p (%dx%d), eglGetError %#x", s, layer, tl_nwindow_width(win), tl_nwindow_height(win), a_eglGetError());
     return s;
 }
 static EGLBoolean w_eglDestroySurface(EGLDisplay d, EGLSurface s)
 {
+    tl_log_line("renderdiag: egl-surface-destroy thread=%p surface=%p", (void *)pthread_self(), s);
     pthread_mutex_lock(&g_tex_lock);
     for (int i = 0; i < MAX_TEX_SURFACES; i++) if (g_tex_surf[i].s == s) g_tex_surf[i].s = NULL;
     bool comp = false;
