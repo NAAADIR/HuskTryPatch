@@ -1803,6 +1803,85 @@ static struct { pthread_mutex_t m; fut_waiter *head, *tail; } g_fut[FUT_BUCKETS]
 
 static int g_futex_trace = -1;
 
+/* Guest AArch64 iovecs have the same two 64-bit fields as Darwin's iovec.
+ * vm_read_overwrite is a kernel-checked copy, including for the destination;
+ * checking a VM region followed by memcpy would race with unmap/mprotect. */
+_Static_assert(sizeof(struct iovec) == 16, "64-bit guest iovec layout required");
+static bool self_vm_copy(void *dst, const void *src, size_t len)
+{
+    if (!len) return true;
+    vm_size_t copied = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)src, (vm_size_t)len,
+                             (vm_address_t)(uintptr_t)dst, &copied) == KERN_SUCCESS && copied == len;
+}
+
+long tl_process_vm_readv(int pid, const void *local, unsigned long local_count,
+                         const void *remote, unsigned long remote_count, unsigned long flags)
+{
+    enum { LINUX_IOV_MAX = 1024, FAST_IOV = 8 };
+    struct iovec local_fast[FAST_IOV], remote_fast[FAST_IOV];
+    struct iovec *lv = local_fast, *rv = remote_fast;
+    unsigned long i;
+    size_t lt = 0, rt = 0;
+    long result = 0;
+    if (flags || local_count > LINUX_IOV_MAX) return -22;
+    if (!local_count) return 0;
+    if (local_count > FAST_IOV && !(lv = malloc(local_count * sizeof(*lv)))) return -12;
+    if (!self_vm_copy(lv, local, local_count * sizeof(*lv))) { result = -14; goto done; }
+    for (i = 0; i < local_count; ++i) {
+        size_t len = lv[i].iov_len;
+        uintptr_t addr = (uintptr_t)lv[i].iov_base;
+        if (len > (size_t)LONG_MAX - lt) { result = -22; goto done; }
+        if (len && addr > UINTPTR_MAX - len) { result = -14; goto done; }
+        lt += len;
+    }
+    /* Linux does not inspect the remote vector or PID for an empty local stream. */
+    if (!lt) goto done;
+    if (remote_count > LINUX_IOV_MAX) { result = -22; goto done; }
+    if (!remote_count) goto done;
+    if (remote_count > FAST_IOV && !(rv = malloc(remote_count * sizeof(*rv)))) { result = -12; goto done; }
+    if (!self_vm_copy(rv, remote, remote_count * sizeof(*rv))) { result = -14; goto done; }
+    for (i = 0; i < remote_count; ++i) {
+        size_t len = rv[i].iov_len;
+        if (len > (size_t)LONG_MAX - rt) { result = -22; goto done; }
+        rt += len;
+    }
+    if (!rt) goto done;
+    /* Husk exposes the host PID to guests and does not implement guest fork. */
+    if (pid != (int)getpid()) { result = -3; goto done; }
+    {
+        unsigned long li = 0, ri = 0;
+        size_t lo = 0, ro = 0, copied = 0;
+        size_t page = (size_t)getpagesize();
+        size_t limit = (size_t)INT_MAX - (size_t)INT_MAX % page; /* Linux MAX_RW_COUNT */
+        while (li < local_count && ri < remote_count && copied < limit) {
+            if (lo == lv[li].iov_len) { ++li; lo = 0; continue; }
+            if (ro == rv[ri].iov_len) { ++ri; ro = 0; continue; }
+            uintptr_t ld = (uintptr_t)lv[li].iov_base + lo;
+            uintptr_t rb = (uintptr_t)rv[ri].iov_base;
+            if (ro > UINTPTR_MAX - rb) { result = copied ? (long)copied : -14; goto done; }
+            uintptr_t rs = rb + ro;
+            size_t n = lv[li].iov_len - lo;
+            if (n > rv[ri].iov_len - ro) n = rv[ri].iov_len - ro;
+            if (n > limit - copied) n = limit - copied;
+            /* Split at both page boundaries so a bad later page produces a partial read. */
+            size_t lpage = page - ld % page, rpage = page - rs % page;
+            if (n > lpage) n = lpage;
+            if (n > rpage) n = rpage;
+            if (rs > UINTPTR_MAX - (n - 1) || !self_vm_copy((void *)ld, (const void *)rs, n)) {
+                result = copied ? (long)copied : -14;
+                goto done;
+            }
+            copied += n; lo += n; ro += n;
+        }
+        result = (long)copied;
+    }
+done:
+    if (rv != remote_fast) free(rv);
+    if (lv != local_fast) free(lv);
+    return result;
+}
+
 static void fut_unlink(size_t h, fut_waiter *w)
 {
     fut_waiter **pp = &g_fut[h].head, *prev = NULL;
@@ -1899,9 +1978,11 @@ static long futex_call(uint32_t *addr, int op, uint32_t val, const struct timesp
 static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long a5, long nr);
 long tl_linux_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr)
 {
+    void tl_bf_gcore_diag_syscall(long nr, long result);
     static int trace = -1;
     if (trace < 0) trace = getenv("TL_SYSCALL_TRACE") ? 1 : 0;
     long r = linux_syscall_impl(a0, a1, a2, a3, a4, a5, nr);
+    tl_bf_gcore_diag_syscall(nr, r);
     if (trace) tl_log_line("syscall %ld(%#lx, %#lx, %#lx) -> %ld", nr, a0, a1, a2, r);
     return r;
 }
@@ -1909,6 +1990,8 @@ static long linux_syscall_impl(long a0, long a1, long a2, long a3, long a4, long
 {
     (void)a4; (void)a5;
     switch (nr) {
+    case 270: return tl_process_vm_readv((int)a0, (const void *)a1, (unsigned long)a2,
+                                        (const void *)a3, (unsigned long)a4, (unsigned long)a5);
     case 178: { uint64_t t = 0; pthread_threadid_np(NULL, &t); return (long)t; }       /* gettid */
     case 172: return getpid();
     case 173: return getppid();

@@ -7,12 +7,15 @@
 #include "../../src/translation-layer-next/husk-tl-ld.c"
 
 static char last_log[512];
+static char all_logs[8192];
 void tl_log_line(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
     vsnprintf(last_log, sizeof(last_log), fmt, args);
     va_end(args);
+    strncat(all_logs, last_log, sizeof(all_logs) - strlen(all_logs) - 1);
+    strncat(all_logs, "\n", sizeof(all_logs) - strlen(all_logs) - 1);
 }
 
 static int force_calls, guest_calls, shutdown_calls, notice_calls;
@@ -48,10 +51,18 @@ int main(void)
     assert(bf_diag_relocation(&game, &sym, name, R_JUMP_SLOT, (uintptr_t)guest_original) == (uintptr_t)guest_original);
     assert(strstr(last_log, "skipped=another_image"));
     bf_diag_hook_report(&game);
-    assert(strstr(last_log, "hook_summary force=1 parse=0 guest=0 shutdown=0 notice=0"));
+    assert(strstr(all_logs, "hook_summary force=1 parse=0 guest=0 shutdown=0 notice=0"));
     /* Ensure the wrapper never truncates the unknown native return type to bool. */
     atomic_store_explicit(&bf_parse_fn, (uintptr_t)parse_original, memory_order_release);
     assert(bf_diag_parse((void *)1, (void *)2) == (uintptr_t)0x123456789abcdef0ULL);
+
+    /* Vtable interception is restricted to exact slots and zero addends. */
+    sym.st_value = 0x13919dc;
+    const char *game_parse_name = "_ZN18GameResponseParser5parseEPKcP11RequestData";
+    assert(bf_diag_abs_relocation(&game, &sym, game_parse_name, 0x27400d8, 1, orig) == orig);
+    assert(bf_diag_abs_relocation(&game, &sym, game_parse_name, 0x27400e0, 0, orig) == orig);
+    assert(bf_diag_abs_relocation(&game, &sym, game_parse_name, 0x27400d8, 0, orig) == (uintptr_t)bf_corr_game_parse);
+    assert(!bf_corr_layout_ok(&game));
 
     sym.st_value = 0x1b8741c;
     void (*guest)(void *, void *) = (void *)(uintptr_t)bf_diag_relocation(&game, &sym,
@@ -70,11 +81,11 @@ int main(void)
         "_ZN9GameScene17changeNoticeSceneEiRKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEEbi",
         R_JUMP_SLOT, (uintptr_t)notice_original);
     notice((void *)1, 3, (void *)2, true, -1);
-    assert(notice_calls == 1 && strstr(last_log, "BF-AUTH-DIAG notice"));
+    assert(notice_calls == 1 && strstr(all_logs, "BF-AUTH-DIAG notice"));
     /* A new application session must not inherit pointers to unloaded code. */
     bf_diag_reset();
     bf_diag_hook_report(&game);
-    assert(strstr(last_log, "hook_summary force=0 parse=0 guest=0 shutdown=0 notice=0"));
+    assert(strstr(all_logs, "hook_summary force=0 parse=0 guest=0 shutdown=0 notice=0"));
     force_calls = 0;
     void *second = (void *)(uintptr_t)bf_diag_relocation(&game, &sym,
         "_ZN9GameScene17changeNoticeSceneEiRKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEEbi",

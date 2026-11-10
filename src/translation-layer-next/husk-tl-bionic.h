@@ -97,6 +97,10 @@ void tl_log_line(const char *fmt, ...);
 /* A one-line note, once per distinct text, for things that are stubbed. */
 void tl_note_once(const char *what);
 
+/* Linux process_vm_readv, restricted to this process; returns bytes or -Linux errno. */
+long tl_process_vm_readv(int pid, const void *local, unsigned long local_count,
+                         const void *remote, unsigned long remote_count, unsigned long flags);
+
 #ifdef __cplusplus
 }
 #endif

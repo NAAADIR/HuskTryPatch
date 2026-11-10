@@ -179,9 +179,9 @@ static int b_unshare(int flags) { (void)flags; tl_set_guest_errno(1 /* EPERM */)
 static int b_pidfd_open(int pid, unsigned flags) { (void)pid; (void)flags; tl_set_guest_errno(38); return -1; }
 static long b_process_vm_readv(int pid, const void *l, unsigned long ln, const void *r, unsigned long rn, unsigned long f)
 {
-    (void)pid; (void)l; (void)ln; (void)r; (void)rn; (void)f;
-    tl_set_guest_errno(38);
-    return -1;
+    long result = tl_process_vm_readv(pid, l, ln, r, rn, f);
+    if (result < 0) { tl_set_guest_errno((int)-result); return -1; }
+    return result;
 }
 
 /* Real-time signals: bionic numbers them from 32 and keeps the first few for itself. Darwin has none to deliver. */

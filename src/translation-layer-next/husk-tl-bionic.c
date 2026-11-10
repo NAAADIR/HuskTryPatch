@@ -673,6 +673,31 @@ static void dl_fail(const char *fmt, const char *arg)
     t_dlerr_set = true;
 }
 
+/* Observe v20's gcore lookup and subsequent self-read results without replacing
+ * the function pointer or claiming that an unattributed syscall came from it. */
+static _Atomic(bool) bf_gcore_diag_enabled;
+static _Atomic(unsigned) bf_gcore_diag_reports[3];
+static bool bf_gcore_is_v20(void)
+{
+    tl_lib *game = tl_ld_find_lib("libgame.so");
+    uintptr_t base = (uintptr_t)tl_ld_lib_base(game);
+    if (!base) return false;
+    void *body = tl_ld_sym_deep(game, "_ZN17InitializeRequest10createBodyEv", NULL);
+    return (uintptr_t)body == base + 0x13a50dc && *(const uint32_t *)body == 0x1432b0ad;
+}
+void tl_bf_gcore_diag_syscall(long nr, long result)
+{
+    if (nr != 270 || !atomic_load_explicit(&bf_gcore_diag_enabled, memory_order_relaxed)) return;
+    int saved = errno, guest_saved = *tl_guest_errno_ptr();
+    if (tl_ld_find_lib("libgcore.so") && bf_gcore_is_v20()) {
+        unsigned kind = result < 0 ? 0 : result == 0 ? 1 : 2;
+        if (atomic_fetch_add_explicit(&bf_gcore_diag_reports[kind], 1, memory_order_relaxed) < 2)
+            tl_log_line("BF-INIT-DIAG self_read=%s errno=%d caller=unknown",
+                        kind == 0 ? "error" : kind == 1 ? "zero" : "positive", kind == 0 ? (int)-result : 0);
+    }
+    *tl_guest_errno_ptr() = guest_saved; errno = saved;
+}
+
 static void *dlopen_impl(const char *path, int flags);
 /* __loader_dlopen, which bionic's dlopen calls with its caller: the first call in dlopen's code is to it, as on a phone, because
  * liblinkernsbypass (GameNative, Turnip loaders) finds __loader_dlopen by walking dlopen's instructions to its first BL */
@@ -700,6 +725,11 @@ static void *dlopen_impl(const char *path, int flags)
     /* A path to a file of its own (a mod's library) loads from there; a bare name, or a path into the app, from the APK. */
     tl_lib *L = tl_ld_find_lib(base);
     if (!L) L = tl_ld_load(path[0] == '/' ? path : base);
+    if (!L && !strcmp(base, "libgcore.so") && bf_gcore_is_v20()) {
+        int saved = errno, guest_saved = *tl_guest_errno_ptr();
+        tl_log_line("BF-INIT-DIAG gcore_load=failed");
+        *tl_guest_errno_ptr() = guest_saved; errno = saved;
+    }
     if (getenv("TL_DL_TRACE")) tl_log_line("dl: dlopen(%s) -> %s", path, L ? "ok" : "not found");
     if (!L) { dl_fail("dlopen failed: library \"%s\" not found", path); return NULL; }
     tl_ld_init(L);
@@ -745,6 +775,12 @@ static void *bionic_dlsym(void *handle, const char *name)
            libicuuc (its dependency) defines */
         void *tl_ld_sym_deep(tl_lib *lib, const char *name, tl_lib **found_in);
         r = tl_ld_sym_deep((tl_lib *)handle, name, NULL);
+    }
+    if (!strcmp(name, "gcore_tick") && handle && handle == tl_ld_find_lib("libgcore.so") && bf_gcore_is_v20()) {
+        int saved = errno, guest_saved = *tl_guest_errno_ptr();
+        tl_log_line("BF-INIT-DIAG gcore_symbol=%s", r ? "found" : "missing");
+        *tl_guest_errno_ptr() = guest_saved; errno = saved;
+        atomic_store_explicit(&bf_gcore_diag_enabled, r != NULL, memory_order_relaxed);
     }
     if (getenv("TL_DL_TRACE")) tl_log_line("dl: dlsym(%s) -> %s", name, r ? "found" : "missing");
     if (!r) dl_fail("undefined symbol: %s", name);
