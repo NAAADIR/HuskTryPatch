@@ -1812,9 +1812,11 @@ static uint64_t bind_symbol(tl_lib *L, uint32_t symidx, bool *failed)
     return val;
 }
 
-/* BF v20 authentication diagnostic. These wrappers only replace relocation slots;
- * they never write guest instructions or inspect notice text, identifiers or packets. */
+/* BF v20 authentication diagnostic. Wrappers only replace relocation slots. */
 static _Atomic(uintptr_t) bf_force_fn, bf_guest_fn, bf_shutdown_fn, bf_notice_fn, bf_parse_fn;
+static _Atomic(uintptr_t) bf_game_parse_fn, bf_read_param_fn, bf_vector_assign_fn, bf_vector_parse_fn, bf_set_message_fn, bf_check_message_fn;
+
+#include "husk-tl-bf-auth-correlation.h"
 
 /* Do not retain pointers into the previous guest image across a session reset. */
 static void bf_diag_reset(void)
@@ -1824,6 +1826,13 @@ static void bf_diag_reset(void)
     atomic_store_explicit(&bf_shutdown_fn, 0, memory_order_release);
     atomic_store_explicit(&bf_notice_fn, 0, memory_order_release);
     atomic_store_explicit(&bf_parse_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_game_parse_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_read_param_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_vector_assign_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_vector_parse_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_set_message_fn, 0, memory_order_release);
+    atomic_store_explicit(&bf_check_message_fn, 0, memory_order_release);
+    bf_corr_reset();
 }
 
 /* This establishes which GOT/PLT slots were intercepted, NOT that a
@@ -1899,6 +1908,7 @@ __attribute__((noinline)) static void bf_diag_notice(void *self, int kind, const
                          offset == 0x1b85104 ? "shutdown" : "other";
     tl_log_line("BF-AUTH-DIAG notice origin=%s caller_offset=%#llx", origin,
                 (unsigned long long)offset);
+    if (offset == 0x1615ff0) tl_log_line("BF-AUTH-CORR notice=1 seq=%llu", (unsigned long long)bf_corr_notice_sequence());
     errno = saved;
     original(self, kind, message, flag, value);
 }
@@ -1913,20 +1923,42 @@ static uint64_t bf_diag_relocation(tl_lib *L, const elf_sym *s, const char *name
         { "_ZN10TitleScene25onGumiLiveLoginSuccessfulEPN7cocos2d8CCObjectE", 0x1b8741c, R_GLOB_DAT, &bf_guest_fn, (void *)bf_diag_guest, "guest" },
         { "_ZN10TitleScene27gameShutdownCallbackHandlerEPN7cocos2d8CCObjectE", 0x1b850c0, R_GLOB_DAT, &bf_shutdown_fn, (void *)bf_diag_shutdown, "shutdown" },
         { "_ZN9GameScene17changeNoticeSceneEiRKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEEbi", 0x1608470, R_JUMP_SLOT, &bf_notice_fn, (void *)bf_diag_notice, "notice" },
+        { "_ZNSt6__ndk16vectorIN8picojson5valueENS_9allocatorIS2_EEE6assignIPS2_EENS_9enable_ifIXaasr21__is_forward_iteratorIT_EE5valuesr16is_constructibleIS2_NS_15iterator_traitsIS9_E9referenceEEE5valueEvE4typeES9_S9_", 0x139b610, R_JUMP_SLOT, &bf_vector_assign_fn, (void *)bf_corr_vector_assign, "corr_assign" },
+        { "_ZN12ResponseData5parseERNSt6__ndk16vectorIN8picojson5valueENS0_9allocatorIS3_EEEE", 0x100773c, R_JUMP_SLOT, &bf_vector_parse_fn, (void *)bf_corr_vector_parse, "corr_vector_parse" },
+        { "_ZN12MessageState10setMessageENSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE", 0x122a4fc, R_JUMP_SLOT, &bf_set_message_fn, (void *)bf_corr_set_message, "corr_state" },
+        { "_ZN9GameScene20checkResponseMessageEv", 0x1615e4c, R_JUMP_SLOT, &bf_check_message_fn, (void *)bf_corr_check_message, "corr_check" },
     };
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
         const struct entry *e = &entries[i];
         if (type != e->type || s->st_value != e->va || strcmp(name, e->name)) continue;
+        if (e->slot == &bf_vector_assign_fn && !bf_corr_layout_ok(L)) return original;
         uintptr_t expected = 0;
         if (!atomic_compare_exchange_strong_explicit(e->slot, &expected, (uintptr_t)original,
                                                      memory_order_acq_rel, memory_order_acquire) && expected != (uintptr_t)original) {
-            tl_log_line("BF-AUTH-DIAG hook=%s skipped=another_image", e->label);
+            if (strncmp(e->label, "corr_", 5)) tl_log_line("BF-AUTH-DIAG hook=%s skipped=another_image", e->label);
             return original;
         }
-        tl_log_line("BF-AUTH-DIAG hook=%s installed", e->label);
+        if (strncmp(e->label, "corr_", 5)) tl_log_line("BF-AUTH-DIAG hook=%s installed", e->label);
         return (uint64_t)(uintptr_t)e->wrapper;
     }
     return original;
+}
+
+/* These are two exact vtable slots, with zero addends, for this ELF only. */
+static uint64_t bf_diag_abs_relocation(tl_lib *L, const elf_sym *s, const char *name,
+                                       uint64_t where, int64_t addend, uint64_t original)
+{
+    if (!s || !original || original == 1 || addend || L->build || L->arm32 || strcmp(L->soname, "libgame.so")) return original;
+    _Atomic(uintptr_t) *slot = NULL; void *wrapper = NULL;
+    if (where == 0x27400d8 && s->st_value == 0x13919dc && !strcmp(name, "_ZN18GameResponseParser5parseEPKcP11RequestData")) {
+        slot = &bf_game_parse_fn; wrapper = (void *)bf_corr_game_parse;
+    } else if (where == 0x27482b0 && s->st_value == 0x13e1e2c && !strcmp(name, "_ZN15MessageResponse9readParamEiiPKcS1_b")) {
+        slot = &bf_read_param_fn; wrapper = (void *)bf_corr_read_param;
+    }
+    if (!slot) return original;
+    uintptr_t expected = 0;
+    if (!atomic_compare_exchange_strong(slot, &expected, (uintptr_t)original) && expected != (uintptr_t)original) return original;
+    return (uintptr_t)wrapper;
 }
 
 /* A copied page's data is relocated in its copy, which is what the rewritten code reads. In an older dylib layout the original
@@ -1969,6 +2001,8 @@ static bool reloc_one_into(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t
         if (v == 1 && L->symcache) v = 0;
         if (type != R_ABS64)
             v = bf_diag_relocation(L, sym_at(L, symidx), sym_name(L, sym_at(L, symidx)), type, v);
+        else
+            v = bf_diag_abs_relocation(L, sym_at(L, symidx), sym_name(L, sym_at(L, symidx)), r_offset, addend, v);
         *place = v + (type == R_ABS64 ? (uint64_t)addend : 0);
         return true;
     }
