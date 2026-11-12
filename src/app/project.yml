@@ -77,6 +77,8 @@ targets:
         INFOPLIST_FILE: Husk/Info.plist
         CODE_SIGN_ENTITLEMENTS: "$(HUSK_ENTITLEMENTS)"
         SWIFT_OBJC_BRIDGING_HEADER: Husk/HuskBridge.h
+        OTHER_CFLAGS: "$(inherited) $(HUSK_OOP_CFLAGS)"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) $(HUSK_OOP_SWIFT_FLAGS)"
         # libqemu-aarch64-softmmu.dylib has install_name @rpath/...
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"

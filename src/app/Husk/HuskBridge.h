@@ -46,6 +46,9 @@ void husk_ios_jit_install_trap_handler(void);
 bool husk_ios_jit_prewarm(size_t bytes);
 bool husk_ios_jit_prewarm_self(size_t bytes);
 bool husk_ios_jit_is_available(void);
+/* Defined and called only in the opt-in diagnostic build. */
+int husk_oop_ios_run(const char *fixture_path);
+void husk_oop_ios_preflight_fail(int jit_ready);
 /* Whether a plain MAP_JIT mapping executes in this process -- the second of the
  * two routes to executable memory, measured rather than predicted. */
 bool husk_ios_jit_mapjit_works(void);

@@ -64,6 +64,7 @@ fi
 echo "==> building"
 xcodebuild -project "$HUSK_ROOT/src/app/Husk.xcodeproj" -scheme Husk \
     -sdk iphoneos -configuration Release -derivedDataPath "$DD" \
+    "HUSK_OOP_CFLAGS=${HUSK_OOP_CFLAGS:-}" "HUSK_OOP_SWIFT_FLAGS=${HUSK_OOP_SWIFT_FLAGS:-}" \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
     build 2>&1 | tee "$DD/build.log" | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
 

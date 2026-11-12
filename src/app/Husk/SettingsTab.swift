@@ -697,6 +697,10 @@ struct JITSettings: View {
             .listRowInsets(EdgeInsets())
             .listRowBackground(Color.clear)
 
+#if HUSK_OOP_IOS_DIAG
+            OOPDiagnosticSection()
+#endif
+
             Section {
                 Picker("Method", selection: $jit.method) {
                     ForEach(JITMethod.allCases) { Text($0.title).tag($0) }

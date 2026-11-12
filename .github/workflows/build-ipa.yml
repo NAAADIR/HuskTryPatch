@@ -2,6 +2,11 @@ name: Build IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      oop_diagnostic:
+        description: Include the development-only out-of-place ARM64 diagnostic
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
@@ -20,6 +25,10 @@ jobs:
           sudo xcode-select -s "$XC/Contents/Developer"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Check iPhoneOS diagnostic sources and fixture
+        if: ${{ inputs.oop_diagnostic }}
+        run: sh scripts/check_oop_ios.sh
 
       - name: Host tools
         run: |
@@ -82,6 +91,9 @@ jobs:
           echo "Framework source commit: $(git rev-parse HEAD)"
 
       - name: Build
+        env:
+          HUSK_OOP_CFLAGS: ${{ inputs.oop_diagnostic && '-DHUSK_OOP_IOS_DIAG=1' || '' }}
+          HUSK_OOP_SWIFT_FLAGS: ${{ inputs.oop_diagnostic && 'HUSK_OOP_IOS_DIAG' || '' }}
         run: ./scripts/ci_build.sh "$PWD/build/Husk.ipa"
 
       - name: Check the IPA carries the Java runtime
@@ -104,6 +116,14 @@ jobs:
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'primitive array allocation failed' > /dev/null
           shasum -a 256 "$RUNNER_TEMP/ipa-Husk"
           echo "IPA executable contains the Java compositor diagnostic from $GITHUB_SHA"
+
+      - name: Verify opt-in diagnostic in the IPA
+        if: ${{ inputs.oop_diagnostic }}
+        run: |
+          unzip -p build/Husk.ipa Payload/Husk.app/husk-oop-fixture.bin > "$RUNNER_TEMP/oop-fixture.bin"
+          cmp src/app/Husk/Resources/husk-oop-fixture.bin "$RUNNER_TEMP/oop-fixture.bin"
+          unzip -p build/Husk.ipa Payload/Husk.app/Husk > "$RUNNER_TEMP/oop-Husk"
+          strings "$RUNNER_TEMP/oop-Husk" | grep -F 'HUSK-OOP-IOS overall=' > /dev/null
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4

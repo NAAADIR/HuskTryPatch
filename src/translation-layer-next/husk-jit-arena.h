@@ -33,6 +33,10 @@ bool husk_jit_arena_open_region(uint8_t *rw, uint8_t *rx, size_t size, size_t ce
 bool husk_jit_arena_open(size_t region_bytes, size_t ceiling_bytes, char *err, size_t errlen);
 
 bool husk_jit_arena_is_open(void);
+#ifdef HUSK_OOP_IOS_DIAG
+bool husk_oop_claim_xmem(void);
+bool husk_oop_xmem_claimed(void);
+#endif
 
 /* bytes is rounded up to whole pages. Returns the writable address and stores the executable
  * one in *rx_out; NULL when refused. Freed pages are zeroed (UDF), so a stale branch into them

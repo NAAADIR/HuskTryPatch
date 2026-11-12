@@ -56,6 +56,9 @@ bool tl_xmem_is_rx(const void *p);
 void tl_xmem_flush(const void *rx, size_t bytes);
 
 size_t tl_xmem_used(void);
+#ifdef HUSK_OOP_IOS_DIAG
+bool tl_xmem_is_unused(void);
+#endif
 size_t tl_xmem_size(void);
 
 /* Whether p is within dist bytes of the executable region (a JIT asking for code memory near its own code). */

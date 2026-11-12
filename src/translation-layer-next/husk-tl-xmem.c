@@ -25,6 +25,12 @@
 #include "husk-tl-internal.h"
 
 void tl_log_line(const char *fmt, ...);
+#ifdef HUSK_OOP_IOS_DIAG
+#include "husk-jit-arena.h"
+#define xmem_address_log(...) do { if (!husk_oop_xmem_claimed()) tl_log_line(__VA_ARGS__); } while (0)
+#else
+#define xmem_address_log(...) tl_log_line(__VA_ARGS__)
+#endif
 
 static struct {
     uint8_t *rx, *rw;
@@ -103,7 +109,7 @@ static bool grant_self(size_t host_bytes, char *err, size_t errlen)
             }
             if (self_selftest(rx, (uint8_t *)(uintptr_t)alias)) {
                 g_x.rx = rx; g_x.rw = (uint8_t *)(uintptr_t)alias; g_x.size = size;
-                tl_log_line("xmem: made its own %zu MiB executable region (%s mapping, rx %p, rw %p, process %s debugged)", size >> 20, h ? "MAP_JIT" : "plain", (void *)rx, (void *)alias, debugged ? "is" : "is not");
+                xmem_address_log("xmem: made its own %zu MiB executable region (%s mapping, rx %p, rw %p, process %s debugged)", size >> 20, h ? "MAP_JIT" : "plain", (void *)rx, (void *)alias, debugged ? "is" : "is not");
                 return true;
             }
             last_errno = EPERM;
@@ -128,8 +134,8 @@ static bool adopt_alias(vm_address_t a, uintptr_t rx, size_t size, const char *h
 {
     if (!near(a, rx)) { vm_deallocate(mach_task_self(), a, size); return false; }
     kern_return_t kr = vm_protect(mach_task_self(), a, size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
-    if (kr != KERN_SUCCESS) { tl_log_line("xmem: %s alias at %p: vm_protect rw failed (%d)", how, (void *)a, kr); vm_deallocate(mach_task_self(), a, size); return false; }
-    tl_log_line("xmem: the writable view was %td MiB from the executable one; a new one (%s) at %p is %td MiB from it", was >> 20, how, (void *)a, (ptrdiff_t)(a - rx) >> 20);
+    if (kr != KERN_SUCCESS) { xmem_address_log("xmem: %s alias at %p: vm_protect rw failed (%d)", how, (void *)a, kr); vm_deallocate(mach_task_self(), a, size); return false; }
+    xmem_address_log("xmem: the writable view was %td MiB from the executable one; a new one (%s) at %p is %td MiB from it", was >> 20, how, (void *)a, (ptrdiff_t)(a - rx) >> 20);
     g_x.rw = (uint8_t *)a;
     return true;
 }
@@ -144,19 +150,19 @@ static void near_alias(void)
     {
         vm_address_t a = rx; vm_size_t sz = 0; natural_t depth = 0; vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
         if (vm_region_recurse_64(me, &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt) == KERN_SUCCESS)
-            tl_log_line("xmem: region rx %p size %zu MiB; the map entry there is %p..%p prot %d/%d tag %u", (void *)rx, size >> 20, (void *)a, (void *)(a + sz), info.protection, info.max_protection, info.user_tag);
+            xmem_address_log("xmem: region rx %p size %zu MiB; the map entry there is %p..%p prot %d/%d tag %u", (void *)rx, size >> 20, (void *)a, (void *)(a + sz), info.protection, info.max_protection, info.user_tag);
         a = rx + size; sz = 0; depth = 0; cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
         if (vm_region_recurse_64(me, &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt) == KERN_SUCCESS)
-            tl_log_line("xmem: next entry after the region: %p..%p prot %d/%d tag %u", (void *)a, (void *)(a + sz), info.protection, info.max_protection, info.user_tag);
+            xmem_address_log("xmem: next entry after the region: %p..%p prot %d/%d tag %u", (void *)a, (void *)(a + sz), info.protection, info.max_protection, info.user_tag);
     }
     /* 1. the kernel's own search, upward from just after the region and from 2 GiB below it */
     uintptr_t hints[2] = { rx + size, rx > reach ? rx - reach : 0 };
     for (int h = 0; h < 2; h++) {
         vm_address_t a = hints[h];
         kern_return_t kr = vm_remap(me, &a, size, 0, VM_FLAGS_ANYWHERE, me, rx, FALSE, &cur, &max, VM_INHERIT_NONE);
-        if (kr != KERN_SUCCESS) { tl_log_line("xmem: remap searching from %p failed (%d)", (void *)hints[h], kr); continue; }
+        if (kr != KERN_SUCCESS) { xmem_address_log("xmem: remap searching from %p failed (%d)", (void *)hints[h], kr); continue; }
         if (adopt_alias(a, rx, size, h ? "searched from below" : "searched from after", d)) return;
-        tl_log_line("xmem: remap searching from %p landed at %p, too far", (void *)hints[h], (void *)a);
+        xmem_address_log("xmem: remap searching from %p landed at %p, too far", (void *)hints[h], (void *)a);
     }
     /* 2. fixed addresses after, then before, in 16 MiB steps out to 2 GiB; and when no gap near the region holds all of it (a
      *    region placed low in the address space, between other mappings), the largest part of it that fits: the region is used
@@ -180,11 +186,11 @@ static void near_alias(void)
     /* 3. a reservation first (plain memory, a hint near the region), then the alias over it */
     for (int h = 0; h < 2; h++) {
         void *res = mmap((void *)hints[h], size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (res == MAP_FAILED) { tl_log_line("xmem: reservation near %p failed (%d)", (void *)hints[h], errno); continue; }
-        if (!near((uintptr_t)res, rx)) { tl_log_line("xmem: reservation near %p landed at %p, too far", (void *)hints[h], res); munmap(res, size); continue; }
+        if (res == MAP_FAILED) { xmem_address_log("xmem: reservation near %p failed (%d)", (void *)hints[h], errno); continue; }
+        if (!near((uintptr_t)res, rx)) { xmem_address_log("xmem: reservation near %p landed at %p, too far", (void *)hints[h], res); munmap(res, size); continue; }
         vm_address_t a = (vm_address_t)res;
         kern_return_t kr = vm_remap(me, &a, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, me, rx, FALSE, &cur, &max, VM_INHERIT_NONE);
-        if (kr != KERN_SUCCESS) { tl_log_line("xmem: alias over the reservation at %p failed (%d)", res, kr); munmap(res, size); continue; }
+        if (kr != KERN_SUCCESS) { xmem_address_log("xmem: alias over the reservation at %p failed (%d)", res, kr); munmap(res, size); continue; }
         if (adopt_alias(a, rx, size, "over a reservation", d)) return;
     }
     tl_log_line("xmem: the writable view is %td MiB from the executable one and no address near it is free", d >> 20);
@@ -346,4 +352,13 @@ void tl_xmem_flush(const void *rx, size_t bytes)
 }
 
 size_t tl_xmem_used(void) { return g_x.used; }
+#ifdef HUSK_OOP_IOS_DIAG
+bool tl_xmem_is_unused(void)
+{
+    pthread_mutex_lock(&g_x.lock);
+    bool unused = g_x.used == 0;
+    pthread_mutex_unlock(&g_x.lock);
+    return unused;
+}
+#endif
 size_t tl_xmem_size(void)  { return g_x.size; }

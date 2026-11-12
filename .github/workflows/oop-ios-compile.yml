@@ -1,0 +1,19 @@
+name: OOP iOS diagnostic compile check
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/brave-frontier-v20]
+jobs:
+  compile:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest Xcode
+        run: |
+          XC="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Compile diagnostic for iPhoneOS arm64
+        run: sh scripts/check_oop_ios.sh

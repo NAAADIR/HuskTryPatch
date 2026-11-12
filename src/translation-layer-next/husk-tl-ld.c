@@ -62,6 +62,10 @@ enum {
 #define MAX_DEPS 48
 
 struct tl_lib {
+#ifdef HUSK_OOP_IOS_DIAG
+    bool oop_test;
+    void *oop_host;
+#endif
     char name[96];                 /* as asked for */
     char soname[96];
     uint8_t *rx, *rw;              /* image: address of base_vaddr, in each view */
@@ -120,6 +124,18 @@ struct tl_lib {
     bool aot;                      /* imported from a dylib made ahead of time (tl_ld_aot_build): its code is already rewritten and read-only */
     bool arm32;                    /* ELF32 ARM, translated to AArch64 (husk-tl-arm32.c) */
 };
+#if defined(HUSK_OOP_LOADER_TEST)
+#define OOP_TEST_LIB(L) true
+#elif defined(HUSK_OOP_IOS_DIAG)
+#define OOP_TEST_LIB(L) ((L)->oop_test)
+#else
+#define OOP_TEST_LIB(L) false
+#endif
+#ifdef HUSK_OOP_IOS_DIAG
+/* Protected by g_big; only the dedicated fixture API sets this. */
+static bool g_oop_mapping;
+static void *g_oop_host;
+#endif
 static inline bool data_page(const tl_lib *L, size_t page);
 static bool in_code(const tl_lib *L, uint64_t vaddr);
 static bool writable_range(const tl_lib *L, uint64_t lo, uint64_t hi);
@@ -390,6 +406,10 @@ static const elf_sym *sym_at(const tl_lib *L, uint32_t i)
 static void *sym_value(const tl_lib *L, const elf_sym *s)
 {
     uint64_t off = s->st_value - L->base_vaddr;
+#if defined(HUSK_OOP_LOADER_TEST) || defined(HUSK_OOP_IOS_DIAG)
+    /* Controlled test builds only: every guest symbol has one guest address. */
+    if (OOP_TEST_LIB(L)) return L->rx + off;
+#endif
     size_t page = (size_t)(off / PAGE);
     bool is_func = (s->st_info & 0xf) == 2;
     if (!is_func && page < L->npages && ((L->pflags[page] & TL_PAGE_W) || writable_vaddr(L, s->st_value))) return waddr(L, off);
@@ -1765,6 +1785,9 @@ static bool redirect_data(const tl_lib *L, uint64_t vaddr)
 static uint64_t image_addr(const tl_lib *L, uint64_t vaddr)
 {
     uint64_t off = vaddr - L->base_vaddr;
+#if defined(HUSK_OOP_LOADER_TEST) || defined(HUSK_OOP_IOS_DIAG)
+    if (OOP_TEST_LIB(L)) return (uint64_t)(uintptr_t)(L->rx + off);
+#endif
     size_t page = (size_t)(off / PAGE);
     /* A function's address is always the executable view, even when a mixed page also
      * holds data: relative C++ vtables add a slot to a vtable pointer, and that pointer
@@ -1786,6 +1809,9 @@ static uint64_t bind_symbol(tl_lib *L, uint32_t symidx, bool *failed)
     if (cached && L->symcache[symidx]) return L->symcache[symidx];
     const elf_sym *s = sym_at(L, symidx);
     const char *name = sym_name(L, s);
+#ifdef HUSK_OOP_IOS_DIAG
+    if (L->oop_test && s->st_shndx == SHN_UNDEF_ && !strcmp(name, "fixture_host")) return (uintptr_t)L->oop_host;
+#endif
     uint64_t val = 0;
     if (s->st_shndx != SHN_UNDEF_ && (s->st_info >> 4) != STB_WEAK_) {
         /* Defined here. Search the scope anyway so an earlier library's definition
@@ -2007,6 +2033,10 @@ static bool reloc_one_into(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t
         return true;
     }
     case R_IRELATIVE: {
+#if defined(HUSK_OOP_LOADER_TEST) || defined(HUSK_OOP_IOS_DIAG)
+        /* A resolver needs a call gate which this controlled harness does not have. */
+        if (OOP_TEST_LIB(L)) return false;
+#endif
         /* The resolver is guest code: run it, store what it returns. */
         uint64_t (*resolver)(void) = (uint64_t (*)(void))(uintptr_t)(L->rx + ((uint64_t)addend - L->base_vaddr));
         *place = resolver();
@@ -2514,6 +2544,9 @@ static void fill_data_slots(tl_lib *L)
 
 static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
 {
+#ifdef HUSK_OOP_IOS_DIAG
+    if (!g_oop_mapping)
+#endif
     tl_ld_trap_signals();       /* raw svc and floating-point traps from the guest's code are answered (svc_signal) */
     /* Mix/copy decisions and the dylib's stub count must see the AOT folder before aot_import runs,
      * otherwise a Mac harness that only sets TL_AOT_DIR in the environment disagrees with the dylib
@@ -2566,6 +2599,9 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     size_t npages = tl_page_plan(loads, (size_t)nloads, has_relro ? &relro : NULL, PAGE, NULL, 0, &base_vaddr);
     if (!npages) { tl_log_line("ld: %s: unusable page layout", name); free(phs); return NULL; }
     uint8_t *flags = malloc(npages);
+#ifdef HUSK_OOP_IOS_DIAG
+    if (g_oop_mapping && !flags) { free(phs); return NULL; }
+#endif
     tl_page_plan(loads, (size_t)nloads, has_relro ? &relro : NULL, PAGE, flags, npages, &base_vaddr);
 
     /* The executable sections, from the section headers when the file has them (it almost always does);
@@ -2712,7 +2748,11 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     if (!vx18_init()) tl_log_line("ld: no thread-specific slot for the virtual x18; instructions using x18 will not be rewritten");
 
     uint8_t *rx, *rw, *dup = NULL;
-    bool imported = !g_aot.on && aot_import(name, file, flen, base_vaddr, npages, nstub, n_mixed, mix, &rx, &rw, &dup);
+    bool imported = !g_aot.on &&
+#ifdef HUSK_OOP_IOS_DIAG
+        !g_oop_mapping &&
+#endif
+        aot_import(name, file, flen, base_vaddr, npages, nstub, n_mixed, mix, &rx, &rw, &dup);
     /* the image, its stub pages, a page of run-time values for the stubs, and a page for its thread block */
     if (imported) {
         /* dyld mapped all of it: the image's pages at their own addresses, executable or writable as the segment says, the stub,
@@ -2739,6 +2779,12 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     }
 
     tl_lib *L = calloc(1, sizeof(*L));
+#ifdef HUSK_OOP_IOS_DIAG
+    if (g_oop_mapping && !L) { free(flags); free(mix); free(phs); return NULL; }
+#endif
+#ifdef HUSK_OOP_IOS_DIAG
+    L->oop_test = g_oop_mapping; L->oop_host = g_oop_host;
+#endif
     snprintf(L->name, sizeof(L->name), "%s", name);
     L->rx = rx; L->rw = rw; L->base_vaddr = base_vaddr; L->npages = npages; L->pflags = flags; L->mixed = mix;
     L->size = (npages + nstub + 2) * PAGE;
@@ -2787,7 +2833,11 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     L->nsyms = count_dynsyms(L);
     L->ncache = dynsym_bound(L, L->nsyms);
     if (L->ncache) L->symcache = calloc(L->ncache, sizeof(uint64_t));
-    if (!g_aot.on) publish_lib(L);
+    if (!g_aot.on
+#ifdef HUSK_OOP_IOS_DIAG
+        && !g_oop_mapping
+#endif
+    ) publish_lib(L);
     return L;
 }
 
@@ -3042,6 +3092,16 @@ static bool relocate(tl_lib *L)
     free(L->symcache);
     L->symcache = NULL;
     if (!ok) { tl_log_line("ld: %s: relocation failed", L->name); return false; }
+#if defined(HUSK_OOP_LOADER_TEST) || defined(HUSK_OOP_IOS_DIAG)
+    /* No constructor, AOT import, TLS, mixed alias, or production runtime use. */
+    if (OOP_TEST_LIB(L)) {
+        if (L->aot || L->arm32 || L->dup || L->tls_id || L->nneeded || L->init || L->init_arraysz || L->n_unresolved) {
+            tl_log_line("ld: controlled out-of-place test fixture has unsupported features"); return false;
+        }
+        L->state = 2;
+        return true;
+    }
+#endif
     bf_diag_hook_report(L);
     size_t t = 0, a = 0, ad = 0, sv = 0;
     if (L->aot) {
@@ -3076,6 +3136,44 @@ static bool relocate(tl_lib *L)
     }
     return true;
 }
+
+#if defined(HUSK_OOP_LOADER_TEST) || defined(HUSK_OOP_IOS_DIAG)
+/* Only compiled into the isolated test executable; callers must serialize writes. */
+bool tl_ld_oop_test_views(tl_lib *L, uint8_t **guest, uint8_t **write, size_t *size)
+{
+    if (!L || !OOP_TEST_LIB(L) || L->state != 2 || L->aot || L->dup || !guest || !write || !size) return false;
+    *guest = L->rx; *write = L->rw; *size = L->npages * PAGE; return true;
+}
+#endif
+
+#ifdef HUSK_OOP_IOS_DIAG
+/* The caller must authenticate the bundled fixture before passing its bytes.
+ * This uses the real mapper and relocator without publishing a guest library,
+ * registering interposes, running constructors, or patching guest code. */
+tl_lib *tl_ld_oop_fixture_open(const uint8_t *bytes, size_t length, void *host)
+{
+    if (!bytes || !length || !host) return NULL;
+    pthread_mutex_lock(&g_big);
+    if (g_oop_mapping || g_aot.on || g_aot_dir || nlibs_acq() || G.napks) { pthread_mutex_unlock(&g_big); return NULL; }
+    uint8_t *copy = malloc(length);
+    if (!copy) { pthread_mutex_unlock(&g_big); return NULL; }
+    memcpy(copy, bytes, length);
+    g_oop_mapping = true; g_oop_host = host;
+    tl_lib *L = map_library("husk-oop-fixture", copy, length);
+    g_oop_mapping = false; g_oop_host = NULL;
+    free(copy);
+    if (L && (L->nneeded || L->init || L->init_arraysz || L->tls_id || L->arm32 || L->aot || L->dup || !relocate(L))) {
+        free(L->symcache); free(L->fde_start); free(L->fde_end); free(L->phdr); free(L->pflags); free(L->mixed); free(L); L = NULL;
+    }
+    pthread_mutex_unlock(&g_big);
+    return L;
+}
+void tl_ld_oop_fixture_close(tl_lib *L)
+{
+    if (!L || !L->oop_test) return;
+    free(L->symcache); free(L->fde_start); free(L->fde_end); free(L->phdr); free(L->pflags); free(L->mixed); free(L);
+}
+#endif
 
 /* Folders a library named only by its file name is also looked for in: the Java runtime's (the APEXes' lib64), and folders the app
  * unpacked libraries into. */

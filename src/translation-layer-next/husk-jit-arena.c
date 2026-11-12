@@ -29,6 +29,9 @@ static struct {
     uint64_t *bits;
     pthread_mutex_t lock;
     volatile int open;
+#ifdef HUSK_OOP_IOS_DIAG
+    bool oop_reserved;
+#endif
 } g_a = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static bool page_used(size_t i) { return (g_a.bits[i >> 6] >> (i & 63)) & 1u; }
@@ -42,6 +45,9 @@ bool husk_jit_arena_open_region(uint8_t *rw, uint8_t *rx, size_t size, size_t ce
 {
     if (!rw || !rx || size < HUSK_JIT_ARENA_PAGE || ((uintptr_t)rw | (uintptr_t)rx | size) & (HUSK_JIT_ARENA_PAGE - 1)) return false;
     pthread_mutex_lock(&g_a.lock);
+#ifdef HUSK_OOP_IOS_DIAG
+    if (g_a.oop_reserved) { pthread_mutex_unlock(&g_a.lock); return false; }
+#endif
     if (g_a.open) { pthread_mutex_unlock(&g_a.lock); return false; }
     size_t pages = size / HUSK_JIT_ARENA_PAGE;
     uint64_t *bits = calloc((pages + 63) / 64, sizeof(uint64_t));
@@ -81,6 +87,11 @@ static bool open_mac(size_t bytes, uint8_t **rw, uint8_t **rx, char *err, size_t
 
 bool husk_jit_arena_open(size_t region_bytes, size_t ceiling_bytes, char *err, size_t errlen)
 {
+#ifdef HUSK_OOP_IOS_DIAG
+    if (__atomic_load_n(&g_a.oop_reserved, __ATOMIC_ACQUIRE)) {
+        snprintf(err, errlen, "restart Husk after the out-of-place diagnostic before using the console arena"); return false;
+    }
+#endif
     if (husk_jit_arena_is_open()) return true;
 #if defined(__APPLE__) && !TARGET_OS_OSX
     (void)region_bytes;
@@ -107,6 +118,20 @@ bool husk_jit_arena_open(size_t region_bytes, size_t ceiling_bytes, char *err, s
     return false;
 #endif
 }
+
+#ifdef HUSK_OOP_IOS_DIAG
+/* xmem remains a bump allocator after the test, so never release this claim
+ * in-process. A fresh launch returns normal console arena ownership. */
+bool husk_oop_claim_xmem(void)
+{
+    pthread_mutex_lock(&g_a.lock);
+    bool ok = !g_a.open && !g_a.oop_reserved;
+    if (ok) __atomic_store_n(&g_a.oop_reserved, true, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_a.lock);
+    return ok;
+}
+bool husk_oop_xmem_claimed(void) { return __atomic_load_n(&g_a.oop_reserved, __ATOMIC_ACQUIRE); }
+#endif
 
 bool husk_jit_arena_is_open(void) { return __atomic_load_n(&g_a.open, __ATOMIC_ACQUIRE) != 0; }
 
