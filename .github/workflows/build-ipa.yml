@@ -7,6 +7,10 @@ on:
         description: Include the development-only out-of-place ARM64 diagnostic
         type: boolean
         default: false
+      bf_init_audit:
+        description: Enable redacted Brave Frontier Initialize provider shapes
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
@@ -88,12 +92,22 @@ jobs:
             cp "build/java-runtime/$dex" "$RUNNER_TEMP/fresh-framework/$dex"
             shasum -a 256 "$RUNNER_TEMP/fresh-framework/$dex"
           done
+          python3 tools/verify_framework_dex.py verify \
+            src/java-framework/src/android/telephony/TelephonyManager.java \
+            build/java-runtime/husk-framework.dex build/java-runtime/husk-framework-core.dex
+          cp build/java-runtime/husk-framework-no-sim.json "$RUNNER_TEMP/fresh-framework/"
+          python3 tests/translation-layer/test_verify_no_sim_dex.py \
+            build/java-runtime/husk-framework.dex build/java-runtime/husk-framework-core.dex
+          python3 tests/translation-layer/test_framework_dex_manifest.py \
+            build/java-runtime/husk-framework.dex build/java-runtime/husk-framework-core.dex
           echo "Framework source commit: $(git rev-parse HEAD)"
 
       - name: Build
         env:
           HUSK_OOP_CFLAGS: ${{ inputs.oop_diagnostic && '-DHUSK_OOP_IOS_DIAG=1' || '' }}
           HUSK_OOP_SWIFT_FLAGS: ${{ inputs.oop_diagnostic && 'HUSK_OOP_IOS_DIAG' || '' }}
+          HUSK_BF_INIT_AUDIT: ${{ inputs.bf_init_audit && '1' || '0' }}
+          HUSK_BF_INIT_REQUIRE_DEX: '1'
         run: ./scripts/ci_build.sh "$PWD/build/Husk.ipa"
 
       - name: Check the IPA carries the Java runtime
@@ -108,12 +122,25 @@ jobs:
             shasum -a 256 "$RUNNER_TEMP/ipa-$dex"
             echo "$dex matches the framework built from $GITHUB_SHA"
           done
+          unzip -p build/Husk.ipa Payload/Husk.app/java-runtime/husk-framework-no-sim.json > "$RUNNER_TEMP/husk-framework-no-sim.json"
+          cmp "$RUNNER_TEMP/fresh-framework/husk-framework-no-sim.json" "$RUNNER_TEMP/husk-framework-no-sim.json"
+          cp "$RUNNER_TEMP/ipa-husk-framework.dex" "$RUNNER_TEMP/husk-framework.dex"
+          cp "$RUNNER_TEMP/ipa-husk-framework-core.dex" "$RUNNER_TEMP/husk-framework-core.dex"
+          python3 tools/verify_framework_dex.py verify \
+            src/java-framework/src/android/telephony/TelephonyManager.java \
+            "$RUNNER_TEMP/husk-framework.dex" "$RUNNER_TEMP/husk-framework-core.dex"
           unzip -p build/Husk.ipa Payload/Husk.app/Husk > "$RUNNER_TEMP/ipa-Husk"
           test -s "$RUNNER_TEMP/ipa-Husk"
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'composed center rgba=' > /dev/null
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'renderdiag: route=host-glsurfaceview' > /dev/null
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'renderdiag: sample stage=' > /dev/null
           strings "$RUNNER_TEMP/ipa-Husk" | grep -F 'primitive array allocation failed' > /dev/null
+          strings "$RUNNER_TEMP/ipa-Husk" > "$RUNNER_TEMP/ipa-Husk-strings"
+          if [ "${{ inputs.bf_init_audit }}" = "true" ]; then
+            grep -F 'BF-INIT-SHAPE provider=' "$RUNNER_TEMP/ipa-Husk-strings" > /dev/null
+          elif grep -F 'BF-INIT-SHAPE provider=' "$RUNNER_TEMP/ipa-Husk-strings" > /dev/null; then
+            echo 'Initialize audit unexpectedly enabled' >&2; exit 1
+          fi
           shasum -a 256 "$RUNNER_TEMP/ipa-Husk"
           echo "IPA executable contains the Java compositor diagnostic from $GITHUB_SHA"
 

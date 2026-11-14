@@ -5,7 +5,8 @@ public class TelephonyManager {
     public static final String ACTION_PHONE_STATE_CHANGED = "android.intent.action.PHONE_STATE", EXTRA_STATE = "state";
     public int getPhoneType() { return PHONE_TYPE_NONE; } public int getSimState() { return SIM_STATE_ABSENT; }
     public String getNetworkCountryIso() { return java.util.Locale.getDefault().getCountry().toLowerCase(java.util.Locale.ROOT); }
-    public String getSimCountryIso() { return getNetworkCountryIso(); } public String getNetworkOperator() { return ""; } public String getNetworkOperatorName() { return ""; }
+    /* There is no Android SIM in this runtime: locale is not a SIM provider country. */
+    public String getSimCountryIso() { return ""; } public String getNetworkOperator() { return ""; } public String getNetworkOperatorName() { return ""; }
     public String getSimOperator() { return ""; } public String getSimOperatorName() { return ""; } public int getNetworkType() { return NETWORK_TYPE_UNKNOWN; } public int getDataNetworkType() { return NETWORK_TYPE_UNKNOWN; }
     public int getCallState() { return CALL_STATE_IDLE; } public int getDataState() { return DATA_DISCONNECTED; } public boolean isNetworkRoaming() { return false; }
     public String getLine1Number() { return null; } public String getDeviceId() { return null; } public String getImei() { return null; } public String getSubscriberId() { return null; }

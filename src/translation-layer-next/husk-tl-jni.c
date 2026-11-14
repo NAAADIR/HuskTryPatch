@@ -483,9 +483,36 @@ void tl_jni_clear(void) { t_pending = NULL; }
 static void jni_ExceptionDescribe(void *env);
 static jvalue g_zero;
 
+#if defined(HUSK_BF_INIT_AUDIT) && HUSK_BF_INIT_AUDIT
+/* Explicitly enabled diagnostic: shape only, never a value or a stable hash.
+ * These are provider calls, not proof that a particular request used them. */
+static void bf_init_provider_shape(const tl_jmeth *m, jvalue result)
+{
+    if (!m || !m->cls || !m->cls->name || !m->name || !m->sig ||
+        strcmp(m->cls->name,"sg/gumi/bravefrontier/BraveFrontierJNI") ||
+        strcmp(m->sig,"()Ljava/lang/String;")) return;
+    static const char *const methods[]={"getDeviceAdvertisingID","getDeviceModel","getISOCountryCode"};
+    static const char *const labels[]={"advertising_id","device_model","sim_country"};
+    static _Atomic(unsigned) counts[3];
+    unsigned i=0; while (i<3 && strcmp(m->name,methods[i])) ++i;
+    if (i==3 || atomic_fetch_add_explicit(&counts[i],1,memory_order_relaxed)>=8) return;
+    int saved=errno, *guest_errno=tl_guest_errno_ptr(), guest_saved=*guest_errno;
+    bool threw=tl_jni_pending(); jobj *obj=threw?NULL:(jobj *)result.l;
+    const char *s=obj?tl_jni_string(obj):NULL;
+    const char *kind=threw?"exception":!obj?"null":!s?"non_string":"string";
+    size_t n=s?strnlen(s,129):0;
+    tl_log_line("BF-INIT-SHAPE provider=%s scope=unattributed kind=%s length=%d truncated=%d",
+                labels[i],kind,s?(int)n:-1,s && n==129);
+    *guest_errno=guest_saved; errno=saved;
+}
+#endif
+
 /* Only the BF native-to-Java identifier calls. Values are never written to the log. */
 static void bf_diag_identifier(const tl_jmeth *m, jvalue result)
 {
+#if defined(HUSK_BF_INIT_AUDIT) && HUSK_BF_INIT_AUDIT
+    bf_init_provider_shape(m,result);
+#endif
     if (!m->cls || !m->cls->name || strcmp(m->sig, "()Ljava/lang/String;")) return;
     bool android_id = !strcmp(m->cls->name, "sg/gumi/bravefrontier/BraveFrontier") && !strcmp(m->name, "getAndroidId");
     bool legacy = !strcmp(m->cls->name, "sg/gumi/bravefrontier/BraveFrontier") && !strcmp(m->name, "getLegacyDeviceUUID");

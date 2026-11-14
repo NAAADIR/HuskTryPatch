@@ -21,6 +21,14 @@ set -euo pipefail
 
 HUSK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DD="${DD:-/tmp/husk_ipa}"
+BF_AUDIT="${HUSK_BF_INIT_AUDIT:-0}"
+BF_REQUIRE_DEX="${HUSK_BF_INIT_REQUIRE_DEX:-0}"
+case "$BF_AUDIT:$BF_REQUIRE_DEX" in [01]:[01]) ;; *) echo 'BF audit and DEX flags must be 0 or 1' >&2; exit 1;; esac
+if [[ "${HUSK_OOP_CFLAGS:-}" == *HUSK_BF_INIT_AUDIT* ]]; then
+    echo 'Set HUSK_BF_INIT_AUDIT=1 separately; do not put it in HUSK_OOP_CFLAGS' >&2; exit 1
+fi
+BF_CFLAGS="${HUSK_OOP_CFLAGS:-}"
+if [ "$BF_AUDIT" = 1 ]; then BF_CFLAGS="$BF_CFLAGS -DHUSK_BF_INIT_AUDIT=1"; BF_REQUIRE_DEX=1; fi
 TROLLSTORE=false
 OUT=""
 for arg in "$@"; do
@@ -68,7 +76,7 @@ fi
 echo "==> building"
 xcodebuild -project "$HUSK_ROOT/src/app/Husk.xcodeproj" -scheme Husk \
     -sdk iphoneos -configuration Release -derivedDataPath "$DD" \
-    "HUSK_OOP_CFLAGS=${HUSK_OOP_CFLAGS:-}" "HUSK_OOP_SWIFT_FLAGS=${HUSK_OOP_SWIFT_FLAGS:-}" \
+    "HUSK_OOP_CFLAGS=$BF_CFLAGS" "HUSK_OOP_SWIFT_FLAGS=${HUSK_OOP_SWIFT_FLAGS:-}" \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
     build 2>&1 | tee "$DD/build.log" | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
 
@@ -94,6 +102,17 @@ if [ -f "$JRT/husk-framework.dex" ]; then
         exit 1
     fi
     echo "==> java runtime: $(stat -f '%z bytes, %Sm' "$JRT/husk-framework.dex")"
+    if [ -f "$JRT/husk-framework-no-sim.json" ] || [ "$BF_REQUIRE_DEX" = 1 ]; then
+        for f in husk-framework.dex husk-framework-core.dex husk-framework-no-sim.json; do
+            [ -f "$JRT/$f" ] && cmp -s "$JRT/$f" "$APP/java-runtime/$f" || {
+                echo "missing or mismatched Java framework artifact: $f" >&2; exit 1; }
+        done
+        python3 "$HUSK_ROOT/tools/verify_framework_dex.py" verify \
+            "$HUSK_ROOT/src/java-framework/src/android/telephony/TelephonyManager.java" \
+            "$APP/java-runtime/husk-framework.dex" "$APP/java-runtime/husk-framework-core.dex"
+    fi
+elif [ "$BF_REQUIRE_DEX" = 1 ]; then
+    echo 'Initialize test requires a freshly built Java framework and both DEX files' >&2; exit 1
 fi
 [ -d "$APP" ] || { echo "no app bundle at $APP" >&2; exit 1; }
 # Do not copy build/aot/*.dylib into the IPA. Those are converted Android game
@@ -133,6 +152,14 @@ if [ -n "$EXE" ] && [ ! -f "$APP/$EXE" ]; then
     rc=1
 elif [ -n "$EXE" ]; then
     printf "  ok       %-28s %s\n" "executable present" "$EXE"
+fi
+if [ -n "$EXE" ] && [ -f "$APP/$EXE" ]; then
+    strings "$APP/$EXE" > "$DD/husk-bf-audit-strings.txt"
+    if grep -F 'BF-INIT-SHAPE provider=' "$DD/husk-bf-audit-strings.txt" > /dev/null; then
+        [ "$BF_AUDIT" = 1 ] || { echo '  unexpected enabled Initialize audit' >&2; rc=1; }
+    else
+        [ "$BF_AUDIT" = 0 ] || { echo '  missing enabled Initialize audit' >&2; rc=1; }
+    fi
 fi
 if [[ "${HUSK_OOP_CFLAGS:-}" == *HUSK_OOP_IOS_DIAG* || "${HUSK_OOP_SWIFT_FLAGS:-}" == *HUSK_OOP_IOS_DIAG* ]]; then
     if ! [[ "${HUSK_OOP_CFLAGS:-}" == *HUSK_OOP_IOS_DIAG* && "${HUSK_OOP_SWIFT_FLAGS:-}" == *HUSK_OOP_IOS_DIAG* ]] ||
@@ -238,6 +265,26 @@ if [ "$TROLLSTORE" = true ]; then
 fi
 TMP_OUT="$STAGE/package.tmp"
 ( cd "$STAGE" && zip -qry "$TMP_OUT" Payload )
+
+# Validate the bytes in the actual archive, before replacing an existing IPA.
+if [ -f "$SAPP/java-runtime/husk-framework-no-sim.json" ]; then
+    mkdir -p "$STAGE/verified-framework"
+    for f in husk-framework.dex husk-framework-core.dex husk-framework-no-sim.json; do
+        unzip -p "$TMP_OUT" "Payload/$(basename "$APP")/java-runtime/$f" > "$STAGE/verified-framework/$f"
+        cmp -s "$SAPP/java-runtime/$f" "$STAGE/verified-framework/$f" || {
+            echo "archive Java framework differs: $f" >&2; exit 1; }
+    done
+    python3 "$HUSK_ROOT/tools/verify_framework_dex.py" verify \
+        "$HUSK_ROOT/src/java-framework/src/android/telephony/TelephonyManager.java" \
+        "$STAGE/verified-framework/husk-framework.dex" "$STAGE/verified-framework/husk-framework-core.dex"
+fi
+unzip -p "$TMP_OUT" "Payload/$(basename "$APP")/$EXE" > "$STAGE/verified-executable"
+strings "$STAGE/verified-executable" > "$STAGE/verified-executable-strings"
+if grep -F 'BF-INIT-SHAPE provider=' "$STAGE/verified-executable-strings" > /dev/null; then
+    [ "$BF_AUDIT" = 1 ] || { echo 'archive unexpectedly enables Initialize audit' >&2; exit 1; }
+else
+    [ "$BF_AUDIT" = 0 ] || { echo 'archive is missing Initialize audit' >&2; exit 1; }
+fi
 
 # Atomic replace so a half-written IPA never sits where the good one was.
 mv -f "$TMP_OUT" "$OUT"

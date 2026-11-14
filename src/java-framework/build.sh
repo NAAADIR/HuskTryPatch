@@ -56,6 +56,8 @@ if [ -n "${HUSK_AOSP_JARS:-}" ]; then
     python3 "$HERE/../../tools/compat/aosppure.py" "$OUT" "$CORE" $HUSK_AOSP_JARS --out="$TMP/aosp-replaced.txt"
     core_dex "$TMP/aosp-replaced.txt" "$CORE"
 fi
+python3 "$HERE/../../tools/verify_framework_dex.py" write \
+    "$HERE/src/android/telephony/TelephonyManager.java" "$OUT" "$CORE"
 rm -rf "$TMP"
 echo "built $OUT"
 echo "built $CORE"
