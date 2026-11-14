@@ -49,6 +49,10 @@ bool husk_ios_jit_is_available(void);
 /* Defined and called only in the opt-in diagnostic build. */
 int husk_oop_ios_run(const char *fixture_path);
 void husk_oop_ios_preflight_fail(int jit_ready);
+int husk_oop_real_apk_matches(const char *apk_path);
+int husk_oop_real_run(const char *apk_path, const char *egl_path, const char *gles_path);
+void husk_oop_real_preflight_fail(int jit_ready);
+bool husk_oop_xmem_claimed(void);
 /* Whether a plain MAP_JIT mapping executes in this process -- the second of the
  * two routes to executable memory, measured rather than predicted. */
 bool husk_ios_jit_mapjit_works(void);

@@ -3,6 +3,9 @@
 #include "husk-tl-perm.h"
 #include "husk-tl-unity-app.h"
 #include "husk-console-host.h"
+#ifdef HUSK_OOP_IOS_DIAG
+#include "husk-jit-arena.h"
+#endif
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -479,6 +482,14 @@ static bool launch(int engine, const char *apk, const char *data_dir, void *meta
         husk_native_unload();
     }
     if (!atomic_compare_exchange_strong(&A.state, &expected, HUSK_UNITY_STARTING)) return false;
+#ifdef HUSK_OOP_IOS_DIAG
+    /* The diagnostic checks A.state again after claiming the region. */
+    if (husk_oop_xmem_claimed()) {
+        atomic_store(&A.state,HUSK_UNITY_IDLE);
+        tl_log_line("native: restart Husk after the out-of-place diagnostic");
+        return false;
+    }
+#endif
     A.engine = engine;
     snprintf(A.apk, sizeof(A.apk), "%s", apk);
     snprintf(A.data, sizeof(A.data), "%s", data_dir);

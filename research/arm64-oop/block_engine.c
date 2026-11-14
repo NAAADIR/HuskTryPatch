@@ -247,7 +247,7 @@ bb_result bb_run(bb_engine *e, bb_state *s, uint64_t stop_pc, size_t budget) {
         bool stop_inside = stop_pc > s->pc && stop_pc - s->pc < (uint64_t)b->count * 4;
         if(b->native && b->count<=budget && !stop_inside) {
             size_t slot=(size_t)(b-e->blocks); ((void (*)(bb_state *))(void *)(e->rx+slot*SLOT))(s);
-            s->pc+=(uint64_t)b->count*4; budget-=b->count; ++e->stats.native_blocks;
+            s->pc+=(uint64_t)b->count*4; budget-=b->count; ++e->stats.native_blocks; e->stats.native_instructions+=b->count;
         } else {
             uint32_t w; if((r=fetch(e,s->pc,&w))!=BB_STOP) return r;
             if((r=step(e,s,w))!=BB_STOP) return r;

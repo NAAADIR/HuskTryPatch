@@ -12,7 +12,8 @@ python3 research/arm64-oop/pack_loader_fixture.py "$tmp/fixture.o" "$tmp/fixture
 cmp "$tmp/fixture.bin" src/app/Husk/Resources/husk-oop-fixture.bin
 for source in src/translation-layer-next/husk-tl-ld.c src/translation-layer-next/husk-jit-arena.c \
               src/translation-layer-next/husk-tl-xmem.c src/translation-layer-next/husk-oop-engine.c \
-              src/translation-layer-next/husk-oop-ios.c; do
+              src/translation-layer-next/husk-oop-ios.c src/translation-layer-next/husk-oop-real-ios.c \
+              src/translation-layer-next/husk-tl-unity-app.c; do
     "$cc" -target arm64-apple-ios16.0 -isysroot "$sdk" -std=gnu11 -DHUSK_OOP_IOS_DIAG=1 \
         -Isrc/translation-layer -Isrc/translation-layer-next -Werror=implicit-function-declaration -fsyntax-only "$source"
 done

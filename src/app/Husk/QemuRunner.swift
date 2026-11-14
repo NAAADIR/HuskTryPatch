@@ -13,6 +13,9 @@ final class QemuRunner: ObservableObject {
     static let shared = QemuRunner()
     private var thread: Thread?
     private(set) var isRunning = false
+#if HUSK_OOP_IOS_DIAG
+    var oopDiagnosticActive = false
+#endif
 
     /// Last line the guest printed about its own setup. The first-boot service in
     /// the guest writes HUSK-SETUP markers to the serial console, which is already
@@ -1219,6 +1222,12 @@ final class QemuRunner: ObservableObject {
     }
 
     func start() {
+#if HUSK_OOP_IOS_DIAG
+        guard !oopDiagnosticActive, !husk_oop_xmem_claimed() else {
+            HuskLog.log("qemu", "restart Husk after the out-of-place diagnostic")
+            return
+        }
+#endif
         guard !isRunning else {
             HuskLog.log("qemu", "start() ignored -- already running")
             return

@@ -10,7 +10,7 @@ typedef struct {
 } bb_state;
 typedef enum { BB_STOP, BB_BUDGET, BB_UNSUPPORTED, BB_MEMORY, BB_ALIGNMENT, BB_INTERNAL } bb_result;
 enum { BB_R = 1, BB_W = 2, BB_X = 4 };
-typedef struct { size_t native_blocks, interpreted_instructions, translations, evictions, invalidations; } bb_stats;
+typedef struct { size_t native_blocks, native_instructions, interpreted_instructions, translations, evictions, invalidations; } bb_stats;
 typedef bool (*bb_host_gate)(bb_state *state, void *opaque);
 /* Single-threaded, sandboxed guest address range. Permissions are logical 4K guest pages. */
 bb_engine *bb_create(const void *image, size_t size, size_t cache_slots);

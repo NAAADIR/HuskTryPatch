@@ -126,11 +126,11 @@ bool husk_oop_claim_xmem(void)
 {
     pthread_mutex_lock(&g_a.lock);
     bool ok = !g_a.open && !g_a.oop_reserved;
-    if (ok) __atomic_store_n(&g_a.oop_reserved, true, __ATOMIC_RELEASE);
+    if (ok) __atomic_store_n(&g_a.oop_reserved, true, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&g_a.lock);
     return ok;
 }
-bool husk_oop_xmem_claimed(void) { return __atomic_load_n(&g_a.oop_reserved, __ATOMIC_ACQUIRE); }
+bool husk_oop_xmem_claimed(void) { return __atomic_load_n(&g_a.oop_reserved, __ATOMIC_SEQ_CST); }
 #endif
 
 bool husk_jit_arena_is_open(void) { return __atomic_load_n(&g_a.open, __ATOMIC_ACQUIRE) != 0; }

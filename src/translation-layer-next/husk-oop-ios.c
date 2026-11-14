@@ -73,6 +73,7 @@ int husk_oop_ios_run(const char *path)
     fprintf(stderr,"HUSK-OOP-IOS jit_ready=pass\n");
     REQUIRE(ALLOC,(!husk_native_loaded_apk || !husk_native_loaded_apk()) &&
             tl_xmem_is_unused() && husk_oop_claim_xmem(),"allocator_busy");
+    REQUIRE(ALLOC,(!husk_native_loaded_apk || !husk_native_loaded_apk()) && tl_xmem_is_unused(),"allocator_busy");
     char err[160];
     if (!tl_xmem_open(32u<<20,err,sizeof(err)) || !tl_xmem_alloc(16384,&cache_rx,&cache_rw)) {
         passed[ALLOC]=false; failed="allocator_unavailable"; goto done;

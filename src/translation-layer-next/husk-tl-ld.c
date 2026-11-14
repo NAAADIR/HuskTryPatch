@@ -64,6 +64,8 @@ enum {
 struct tl_lib {
 #ifdef HUSK_OOP_IOS_DIAG
     bool oop_test;
+    bool oop_real;
+    size_t oop_relocations;
     void *oop_host;
 #endif
     char name[96];                 /* as asked for */
@@ -124,6 +126,9 @@ struct tl_lib {
     bool aot;                      /* imported from a dylib made ahead of time (tl_ld_aot_build): its code is already rewritten and read-only */
     bool arm32;                    /* ELF32 ARM, translated to AArch64 (husk-tl-arm32.c) */
 };
+#if defined(HUSK_OOP_REAL_TEST) && !defined(HUSK_OOP_LOADER_TEST)
+#error HUSK_OOP_REAL_TEST requires the isolated loader test build
+#endif
 #if defined(HUSK_OOP_LOADER_TEST)
 #define OOP_TEST_LIB(L) true
 #elif defined(HUSK_OOP_IOS_DIAG)
@@ -131,9 +136,17 @@ struct tl_lib {
 #else
 #define OOP_TEST_LIB(L) false
 #endif
+#ifdef HUSK_OOP_REAL_TEST
+#define OOP_REAL_LIB(L) true
+#elif defined(HUSK_OOP_IOS_DIAG)
+#define OOP_REAL_LIB(L) ((L)->oop_real)
+#else
+#define OOP_REAL_LIB(L) false
+#endif
 #ifdef HUSK_OOP_IOS_DIAG
-/* Protected by g_big; only the dedicated fixture API sets this. */
+/* Protected by g_big; only the dedicated diagnostic APIs set these. */
 static bool g_oop_mapping;
+static bool g_oop_real_mapping;
 static void *g_oop_host;
 #endif
 static inline bool data_page(const tl_lib *L, size_t page);
@@ -585,7 +598,7 @@ static bool is_cxx_runtime_symbol(const char *name)
 static void *lookup_for(tl_lib *L, const char *name, bool *weak_hit)
 {
     (void)weak_hit;
-    for (int i = 0; i < g_ninterpose; i++) if (!strcmp(g_interpose[i].name, name)) return g_interpose[i].fn;
+    if (!OOP_REAL_LIB(L)) for (int i = 0; i < g_ninterpose; i++) if (!strcmp(g_interpose[i].name, name)) return g_interpose[i].fn;
     build_scope(L);
     const elf_sym *s = lib_find(L, name);
     if (s && (s->st_info & 0xf) != STT_GNU_IFUNC_) return sym_value(L, s);
@@ -1826,6 +1839,12 @@ static uint64_t bind_symbol(tl_lib *L, uint32_t symidx, bool *failed)
         } else if ((s->st_info >> 4) == STB_WEAK_) {
             val = 0;
         } else {
+            if (OOP_REAL_LIB(L)) {
+                L->n_unresolved++;
+                tl_log_line("ld: %s: research mode refuses unresolved import %s", L->name, name);
+                *failed = true;
+                return 0;
+            }
             void *stub = make_stub(name);
             if (!stub) { *failed = true; return 0; }
             val = (uint64_t)(uintptr_t)stub;
@@ -2003,6 +2022,15 @@ static bool reloc_one_into(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t
 {
     uint64_t off = r_offset - L->base_vaddr;
     if (off + 8 > L->npages * PAGE) return false;
+    /* This narrow research mode promises the executable PT_LOAD is unchanged. */
+    for (unsigned i = 0; OOP_REAL_LIB(L) && i < L->phnum; ++i) {
+        const elf_phdr *p = &L->phdr[i];
+        if (p->p_type == PT_LOAD_ && (p->p_flags & PF_X_) && r_offset < p->p_vaddr + p->p_memsz &&
+            r_offset + 8 > p->p_vaddr && type != R_NONE) {
+            tl_log_line("ld: %s: research mode refuses executable-segment relocation", L->name);
+            return false;
+        }
+    }
     /* An imported dylib maps a code page read-only (it is signed and executable). Nothing writes there: the JIT region's views are one
      * memory, but a dylib's are not, so a relocation that names a code page stays as the .so has it. A page that shares its data with
      * code is not code on the data half: it has a writable copy, and the relocation goes there. */
@@ -2025,9 +2053,9 @@ static bool reloc_one_into(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t
         uint64_t v = bind_symbol(L, symidx, &failed);
         if (failed) return false;
         if (v == 1 && L->symcache) v = 0;
-        if (type != R_ABS64)
+        if (!OOP_REAL_LIB(L) && type != R_ABS64)
             v = bf_diag_relocation(L, sym_at(L, symidx), sym_name(L, sym_at(L, symidx)), type, v);
-        else
+        else if (!OOP_REAL_LIB(L))
             v = bf_diag_abs_relocation(L, sym_at(L, symidx), sym_name(L, sym_at(L, symidx)), r_offset, addend, v);
         *place = v + (type == R_ABS64 ? (uint64_t)addend : 0);
         return true;
@@ -2552,6 +2580,11 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
      * otherwise a Mac harness that only sets TL_AOT_DIR in the environment disagrees with the dylib
      * (which was built with g_aot.on) and refuses to load. The app sets the folder itself. */
     if (!g_aot_dir && getenv("TL_AOT_DIR")) tl_ld_set_aot_dir(getenv("TL_AOT_DIR"));
+#ifdef HUSK_OOP_REAL_TEST
+    if (g_aot.on || g_aot_dir || tl_a32_is_elf(file, flen)) {
+        tl_log_line("ld: research mode refuses AOT and ARM32 images"); return NULL;
+    }
+#endif
     if (G.nlibs >= MAX_LIBS) { tl_log_line("ld: too many libraries"); return NULL; }
     const elf_ehdr *eh = (const elf_ehdr *)file;
     if (tl_a32_is_elf(file, flen)) {
@@ -2783,7 +2816,7 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
     if (g_oop_mapping && !L) { free(flags); free(mix); free(phs); return NULL; }
 #endif
 #ifdef HUSK_OOP_IOS_DIAG
-    L->oop_test = g_oop_mapping; L->oop_host = g_oop_host;
+    L->oop_test = g_oop_mapping; L->oop_real = g_oop_real_mapping; L->oop_host = g_oop_host;
 #endif
     snprintf(L->name, sizeof(L->name), "%s", name);
     L->rx = rx; L->rw = rw; L->base_vaddr = base_vaddr; L->npages = npages; L->pflags = flags; L->mixed = mix;
@@ -3091,11 +3124,22 @@ static bool relocate(tl_lib *L)
     free(L->relr_src); L->relr_src = NULL;
     free(L->symcache);
     L->symcache = NULL;
+#ifdef HUSK_OOP_IOS_DIAG
+    if (L->oop_real) L->oop_relocations = count;
+#endif
     if (!ok) { tl_log_line("ld: %s: relocation failed", L->name); return false; }
 #if defined(HUSK_OOP_LOADER_TEST) || defined(HUSK_OOP_IOS_DIAG)
     /* No constructor, AOT import, TLS, mixed alias, or production runtime use. */
     if (OOP_TEST_LIB(L)) {
-        if (L->aot || L->arm32 || L->dup || L->tls_id || L->nneeded || L->init || L->init_arraysz || L->n_unresolved) {
+        if (OOP_REAL_LIB(L)) {
+            tl_log_line("ld: research %s: deps=%d init=%d init_array_bytes=%llu tls=%d dup=%d unresolved=%u relocations=%zu",
+                        L->name, L->nneeded, L->init != 0, (unsigned long long)L->init_arraysz,
+                        L->tls_id != 0, L->dup != NULL, L->n_unresolved, count);
+            /* The research caller checks dependencies; constructors remain unrun. */
+            if (L->aot || L->arm32 || L->dup || L->tls_id || L->n_unresolved) {
+                tl_log_line("ld: strict real-image research mode rejected %s", L->name); return false;
+            }
+        } else if (L->aot || L->arm32 || L->dup || L->tls_id || L->nneeded || L->init || L->init_arraysz || L->n_unresolved) {
             tl_log_line("ld: controlled out-of-place test fixture has unsupported features"); return false;
         }
         L->state = 2;
@@ -3171,7 +3215,71 @@ tl_lib *tl_ld_oop_fixture_open(const uint8_t *bytes, size_t length, void *host)
 void tl_ld_oop_fixture_close(tl_lib *L)
 {
     if (!L || !L->oop_test) return;
-    free(L->symcache); free(L->fde_start); free(L->fde_end); free(L->phdr); free(L->pflags); free(L->mixed); free(L);
+    free(L->symcache); free(L->rela_src); free(L->jmprel_src); free(L->arela_src); free(L->relr_src);
+    free(L->fde_start); free(L->fde_end); free(L->phdr); free(L->pflags); free(L->mixed); free(L);
+}
+
+/* Only called with the two ELF entries from the hash-verified APK.  Neither
+ * image is ever published in G, nor added to the process APK search list. */
+static bool oop_real_elf_ok(const uint8_t *bytes, size_t length)
+{
+    if (!bytes || length < sizeof(elf_ehdr)) return false;
+    const elf_ehdr *h=(const elf_ehdr *)bytes;
+    if (memcmp(h->e_ident,"\x7f""ELF\x02\x01",6) || h->e_machine != EM_AARCH64_ ||
+        h->e_phentsize < sizeof(elf_phdr) || h->e_phoff > length ||
+        h->e_phnum > (length-h->e_phoff)/h->e_phentsize) return false;
+    for (unsigned i=0;i<h->e_phnum;i++) {
+        elf_phdr p; memcpy(&p,bytes+h->e_phoff+(size_t)i*h->e_phentsize,sizeof(p));
+        if (p.p_type == PT_TLS_) return false;
+    }
+    return true;
+}
+static bool oop_real_deps(tl_lib *L, const char *const *names, size_t count)
+{
+    if (!L || L->nneeded != (int)count || L->tls_id || L->aot || L->dup || L->n_mixed || L->arm32) return false;
+    unsigned seen=0;
+    for (int i=0;i<L->nneeded;i++) {
+        if (L->needed[i]>=L->strsz) return false;
+        const char *s=(const char *)at(L,L->strtab)+L->needed[i];
+        size_t available=(size_t)(L->strsz-L->needed[i]);
+        if (!memchr(s,0,available)) return false;
+        size_t j=0; while (j<count && strcmp(s,names[j])) j++;
+        if (j==count || (seen & (1u<<j))) return false;
+        seen |= 1u<<j;
+    }
+    return true;
+}
+bool tl_ld_oop_real_open(const uint8_t *game, size_t game_n, const uint8_t *cpp, size_t cpp_n,
+                         tl_lib **game_out, tl_lib **cpp_out, unsigned *stage, unsigned *unresolved)
+{
+    static const char *const cpp_needs[]={"libc.so","libdl.so"};
+    static const char *const game_needs[]={"libc++_shared.so","liblog.so","libz.so","libGLESv2.so","libc.so","libm.so","libdl.so"};
+    if (!game_out || !cpp_out || !stage || !unresolved) return false;
+    *game_out=NULL; *cpp_out=NULL; *stage=0; *unresolved=0;
+    if (!oop_real_elf_ok(game,game_n) || !oop_real_elf_ok(cpp,cpp_n)) return false;
+    pthread_mutex_lock(&g_big);
+    tl_lib *C=NULL,*L=NULL;
+    if (g_oop_mapping || g_aot.on || g_aot_dir || nlibs_acq() || G.napks) goto done_real;
+    g_oop_mapping=true; g_oop_real_mapping=true;
+    C=map_library("libc++_shared.so",(uint8_t *)cpp,cpp_n);
+    if (C) L=map_library("libgame.so",(uint8_t *)game,game_n);
+    g_oop_mapping=false; g_oop_real_mapping=false;
+    if (!C || !L) goto done_real;
+    *stage=1;
+    if (!oop_real_deps(C,cpp_needs,2) || !oop_real_deps(L,game_needs,7)) goto done_real;
+    for (size_t i=0;i<2;i++) if (!tl_bionic_is_system_lib(cpp_needs[i])) goto done_real;
+    for (size_t i=1;i<7;i++) if (!tl_bionic_is_system_lib(game_needs[i])) goto done_real;
+    C->deps_ready=true; L->deps_ready=true; L->deps[0]=C; L->ndeps=1;
+    *stage=2;
+    if (!relocate(C) || !relocate(L)) { *unresolved=C->n_unresolved+L->n_unresolved; goto done_real; }
+    if (C->oop_relocations!=3529 || L->oop_relocations!=215996) goto done_real;
+    *stage=3; *game_out=L; *cpp_out=C; L=NULL; C=NULL;
+done_real:
+    g_oop_mapping=false; g_oop_real_mapping=false;
+    if (L) tl_ld_oop_fixture_close(L);
+    if (C) tl_ld_oop_fixture_close(C);
+    pthread_mutex_unlock(&g_big);
+    return *stage==3;
 }
 #endif
 
@@ -3215,7 +3323,13 @@ static tl_lib *load_locked(const char *name, int depth, bool system)
 {
     if (!system && strchr(name, '/') && in_system_dir(name)) system = true;
     tl_lib *L = find_loaded_ns(name, system ? NS_SYSTEM : NS_APP);
-    if (L) return L;
+    if (L) {
+#ifdef HUSK_OOP_REAL_TEST
+        /* Fail closed on cycles or an earlier failed load in this process. */
+        if (L->state != 2) return NULL;
+#endif
+        return L;
+    }
     if (tl_bionic_is_system_lib(name)) return NULL;
     if (depth > 32) { tl_log_line("ld: dependency chain too deep at %s", name); return NULL; }
 
@@ -3259,7 +3373,12 @@ static tl_lib *load_locked(const char *name, int depth, bool system)
     for (int i = 0; i < L->nneeded; i++) {
         const char *dn = (const char *)at(L, L->strtab) + L->needed[i];
         if (tl_bionic_is_system_lib(dn)) continue;
-        if (!load_locked(dn, depth + 1, L->system)) tl_log_line("ld: %s: needed library %s could not be loaded", name, dn);
+        if (!load_locked(dn, depth + 1, L->system)) {
+            tl_log_line("ld: %s: needed library %s could not be loaded", name, dn);
+#ifdef HUSK_OOP_REAL_TEST
+            return NULL;
+#endif
+        }
     }
     build_scope(L);
     if (!relocate(L)) return NULL;
@@ -3319,10 +3438,19 @@ static bool init_locked(tl_lib *L)
 
 bool tl_ld_init(tl_lib *lib)
 {
+#ifdef HUSK_OOP_REAL_TEST
+    (void)lib;
+    tl_log_line("ld: constructors are disabled in real-image research mode");
+    return false;
+#else
+#ifdef HUSK_OOP_IOS_DIAG
+    if (lib && lib->oop_real) return false;
+#endif
     pthread_mutex_lock(&g_big);
     bool ok = init_locked(lib);
     pthread_mutex_unlock(&g_big);
     return ok;
+#endif
 }
 
 /* ------------------------------------------------------------ ahead of time */

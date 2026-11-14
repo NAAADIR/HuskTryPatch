@@ -15,13 +15,16 @@ build and verifies the resource and diagnostic marker in the resulting IPA.
 The workflows operate on committed repository content, not uncommitted local
 files. Manual dispatch of the new workflow requires its registration on the
 default branch. Do not run an IPA build until the compile-only check has passed.
+Diagnostic packaging requires XcodeGen to include the new source files, and
+checks for the real diagnostic marker and matching C/Swift build flags.
 
 After an approved diagnostic IPA is built, install it with SideStore and enable
 JIT using Husk's existing method. Before starting Android or an app, open
 Settings → JIT & Sideload → Developer Diagnostic and tap **Run out-of-place
 ARM64 test**. The test requires the debugger-granted mapping and a fresh native
 allocator. It runs once per process; restart Husk before using the console
-arena. A normal native app can subsequently use the same `tl_xmem` allocator.
+arena or starting a native app. Diagnostic builds refuse those starts after the
+allocator is claimed; a normal build without the diagnostic flag is unchanged.
 
 Search `Documents/husk.log` or `Documents/husk-native.log` for `HUSK-OOP-IOS`.
 The prefix reports each requested stage and an error category on failure;
@@ -47,3 +50,40 @@ it is single-threaded and uses checked fallback for memory and control flow.
 It is not a general Android ABI, signal, permission, or self-modifying-code
 implementation. Neither an iOS compile nor a device result has been observed
 until the corresponding check is actually run.
+
+## Real APK diagnostic
+
+The same opt-in build adds a separate **Run real Brave Frontier ARM64 test**
+button. It finds candidates through the installed app library's Android package
+name `sg.gumi.bravefrontier`, then checks other installed APKs by hash if
+needed. Filenames and labels are not used. It verifies the
+full V20 APK SHA-256 and separately verifies both extracted ELF entries before
+loading. It does not bundle the APK. If the package is absent or the checksum
+differs, it fails before claiming executable memory. The work runs off the UI
+thread. Start with JIT enabled and no game or console running; after either
+diagnostic claims its allocator, fully restart Husk before another run or a
+game. The claim is retained on failures after allocation as well.
+
+The test opens the APK privately and uses the existing ELF mapper/relocator
+with a private scope containing the APK's libc++_shared.so, Husk's bionic
+resolver and the app-bundled ANGLE dylib. Neither library is published to the
+normal loader registry. It rejects unknown dependencies, unresolved strong
+imports, executable-segment relocations, TLS, mixed/copy pages, AOT and
+IRELATIVE execution. Constructor and JNI initialization are not run. Only the
+three previously verified functions execute. The existing debugger-granted xmem
+aliases back the guest image and a distinct cache; all test writes are tracked.
+The test fails if fewer than 64 MiB remain in the debugger-granted region.
+
+`HUSK-OOP-REAL` reports each stage, `error_category`, guest native instruction
+and block counts, and checked fallback instruction count. `unresolved_imports`
+is -1 when symbol resolution was not reached; resolution stops at the first
+missing strong import. A `fail` stage can mean that an earlier stage prevented
+it from running. Search the log for this prefix; the new prefix contains no
+addresses, request data or fingerprint values. A device crash during a native
+entry may prevent the final status from being written.
+
+The private iOS diagnostic path can also be exercised on Apple Silicon macOS:
+`sh research/arm64-oop/run-real-ios-host.sh`. Set `HUSK_TEST_ANGLE_EGL` and
+`HUSK_TEST_ANGLE_GLES` when macOS ANGLE is not installed at the paths in the
+runner. This host result does not establish iOS ANGLE exports, actual device
+memory availability, iPhoneOS compilation, or the server's rejection reason.

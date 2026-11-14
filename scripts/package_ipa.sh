@@ -58,6 +58,10 @@ if command -v xcodegen >/dev/null 2>&1; then
     echo "==> regenerating the project from project.yml"
     (cd "$HUSK_ROOT/src/app" && xcodegen generate --quiet)
 else
+    if [[ "${HUSK_OOP_CFLAGS:-}" == *HUSK_OOP_IOS_DIAG* || "${HUSK_OOP_SWIFT_FLAGS:-}" == *HUSK_OOP_IOS_DIAG* ]]; then
+        echo "xcodegen is required for an OOP diagnostic build; the checked-in project may omit diagnostic sources" >&2
+        exit 1
+    fi
     echo "==> xcodegen not installed; using the checked-in project as-is" >&2
 fi
 
@@ -129,6 +133,13 @@ if [ -n "$EXE" ] && [ ! -f "$APP/$EXE" ]; then
     rc=1
 elif [ -n "$EXE" ]; then
     printf "  ok       %-28s %s\n" "executable present" "$EXE"
+fi
+if [[ "${HUSK_OOP_CFLAGS:-}" == *HUSK_OOP_IOS_DIAG* || "${HUSK_OOP_SWIFT_FLAGS:-}" == *HUSK_OOP_IOS_DIAG* ]]; then
+    if ! [[ "${HUSK_OOP_CFLAGS:-}" == *HUSK_OOP_IOS_DIAG* && "${HUSK_OOP_SWIFT_FLAGS:-}" == *HUSK_OOP_IOS_DIAG* ]] ||
+       [ -z "$EXE" ] || ! strings "$APP/$EXE" | grep -F 'HUSK-OOP-REAL overall=' > /dev/null; then
+        echo "  MISSING  real APK OOP diagnostic or matching C/Swift flags" >&2
+        rc=1
+    fi
 fi
 
 # Both dylibs must be embedded, or the app dies at launch with a dyld error.
