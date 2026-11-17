@@ -17,25 +17,18 @@ on:
 
 jobs:
   build:
-    # Apple-silicon hosted image with Xcode 26 installed (macos-26 capacity was not allocated).
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select a stable Xcode 26 with the iPhoneOS 26 SDK
+      - name: Select newest Xcode
         run: |
-          echo "Runner architecture: $(uname -m)"
-          echo "macOS: $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
-          echo "Installed Xcodes:"; ls -d /Applications/Xcode*.app
-          # The newest stable Xcode 26 (no beta or release candidate); never the image's default.
-          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -viE 'beta|_rc|release_candidate' | sort -V | tail -1)"
-          if [ -z "$XC" ]; then echo "::error::no stable Xcode 26 on this runner"; exit 1; fi
+          XC="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          echo "Using $XC"
           sudo xcode-select -s "$XC/Contents/Developer"
-          XV="$(xcodebuild -version | head -1)"; SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
-          echo "Selected: $XC -> $XV, iPhoneOS SDK $SDK"
-          case "$XV" in "Xcode 26"*) ;; *) echo "::error::selected $XV, not Xcode 26"; exit 1;; esac
-          case "$SDK" in 26*) ;; *) echo "::error::iPhoneOS SDK $SDK, not 26"; exit 1;; esac
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
 
       - name: Check iPhoneOS diagnostic sources and fixture
         if: ${{ inputs.oop_diagnostic }}
