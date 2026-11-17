@@ -101,6 +101,10 @@ jobs:
           python3 tests/translation-layer/test_framework_dex_manifest.py \
             build/java-runtime/husk-framework.dex build/java-runtime/husk-framework-core.dex
           echo "Framework source commit: $(git rev-parse HEAD)"
+          # The native GL loop (husk-tl-dvm-android.c) needs this branch's GLSurfaceView lifecycle API; the 3.4 release's
+          # framework lacks it and the app's renderer would then never reach onSurfaceCreated.
+          python3 -c "import sys; d=open(sys.argv[1],'rb').read(); sys.exit(0 if b'huskHasSurface' in d else 'husk-framework.dex lacks GLSurfaceView.huskHasSurface')" \
+            build/java-runtime/husk-framework.dex
 
       - name: Build
         env:

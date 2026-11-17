@@ -62,6 +62,9 @@ struct dvm_method {
     bool jni_looked;
     unsigned jni_gen;               /* tl_jni_natives_generation() when jni was looked up */
     signed char critical;           /* @CriticalNative: 1 yes, -1 no, 0 not looked at yet */
+#ifdef HUSK_OOP_IOS_DIAG
+    bool jni_foreign;               /* jni names a function of the private out-of-place image (tl_dvm_set_foreign_natives) */
+#endif
     jobj *proxy_method;             /* a Proxy class's method: the interface Method it hands the InvocationHandler */
     jobj *proxy_throws;             /* and the Class[] of checked exceptions it declares */
 };

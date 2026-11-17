@@ -49,6 +49,7 @@ int main(int argc,char **argv)
     assert(!strcmp(argv[1],"real"));
     assert(husk_oop_real_apk_matches(argv[2]));
     assert(husk_oop_real_run(argv[2],argv[3],argv[4]));
+    printf("real diagnostic xmem allocated=%zu bytes; region=%zu bytes; cache=16384 bytes\n",tl_xmem_used(),tl_xmem_size());
     assert(!tl_ld_find_lib("libgame.so") && !tl_ld_find_lib("libc++_shared.so"));
     assert(husk_oop_xmem_claimed() && !husk_oop_real_run(argv[2],argv[3],argv[4]));
     puts("private real APK loader and one-use allocator: PASS");

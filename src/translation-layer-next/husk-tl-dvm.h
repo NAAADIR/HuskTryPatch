@@ -48,6 +48,15 @@ const char *tl_dvm_describe_pending(char *buf, size_t n);
 
 void tl_dvm_set_trace(int level);       /* 1: classes and natives; 2: every invoke */
 
+#ifdef HUSK_OOP_IOS_DIAG
+/* Opt-in diagnostic builds only: natives of a library the production loader never publishes (the out-of-place research image).
+ * resolve answers a JNI symbol the published libraries lack (NULL: none); call runs it with the method's shorty, the receiver
+ * (the class object for a static method) and its typed arguments, and returns false with a Java exception pending on failure. */
+typedef void *(*tl_dvm_foreign_resolve_fn)(void *opaque, const char *symbol);
+typedef bool (*tl_dvm_foreign_call_fn)(void *opaque, void *fn, const char *shorty, jobj *target, const jvalue *args, int nargs, jvalue *ret);
+void tl_dvm_set_foreign_natives(tl_dvm_foreign_resolve_fn resolve, tl_dvm_foreign_call_fn call, void *opaque);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

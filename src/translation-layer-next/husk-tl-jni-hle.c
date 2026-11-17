@@ -527,6 +527,18 @@ static void v8_jitless(tl_lib *L, const char *base)
     set_flags("--jitless");
     tl_log_line("jni: %s carries V8: told to run without its JIT (--jitless)", base);
 }
+#ifdef HUSK_OOP_IOS_DIAG
+/* Opt-in out-of-place execution: a library the OOP image serves (it is already mapped, initialized and its JNI_OnLoad run out of
+ * place, its natives reached through tl_dvm_set_foreign_natives) is claimed here and never loaded a second time in place. The
+ * claim answers 1 (served), 0 (not an OOP library) or -1 (an OOP library that cannot be served: the load fails, it never falls
+ * back to in-place execution). */
+static int (*g_oop_claim)(const char *leaf, void *opaque);
+static void *g_oop_claim_opaque;
+void tl_jni_set_oop_library_claim(int (*claim)(const char *leaf, void *opaque), void *opaque)
+{
+    g_oop_claim_opaque = opaque; g_oop_claim = claim;
+}
+#endif
 static bool load_native_library(const char *base)
 {
     const char *leaf = strrchr(base, '/');
@@ -534,9 +546,19 @@ static bool load_native_library(const char *base)
     /* System.loadLibrary("libc") becomes liblibc.so; treat that as the system libc. */
     if (!strcmp(leaf, "liblibc.so")) leaf = "libc.so";
     if (tl_bionic_is_system_lib(leaf)) return true;
+#ifdef HUSK_OOP_IOS_DIAG
+    if (g_oop_claim) {
+        int claimed = g_oop_claim(leaf, g_oop_claim_opaque);
+        if (claimed > 0) { tl_log_line("jni: %s: served by the out-of-place image", leaf); return true; }
+        if (claimed < 0) { tl_log_line("jni: %s: out-of-place image cannot serve it; not loaded in place", leaf); return false; }
+    }
+#endif
     tl_lib *L = tl_ld_load(base);
     if (!L) return false;
-    tl_ld_init(L);
+    if (!tl_ld_init(L)) {
+        tl_log_line("jni: %s: library initialization failed", base);
+        return false;
+    }
     pthread_mutex_lock(&g_onload_mu);
     bool first = true;
     for (int i = 0; i < g_nonload; i++) if (g_onload_done[i] == L) first = false;

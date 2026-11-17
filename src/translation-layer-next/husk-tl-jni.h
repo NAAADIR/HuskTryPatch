@@ -78,6 +78,9 @@ jobj *tl_jni_class_object(const char *name);                  /* the java.lang.C
 void tl_jni_register_hle(const tl_jhle *table);               /* NULL-terminated by cls == NULL */
 bool tl_jni_class_known(const tl_jclass *c);                  /* an HLE method or registered natives for it */
 
+#ifdef HUSK_OOP_IOS_DIAG
+void tl_jni_set_oop_library_claim(int (*claim)(const char *leaf, void *opaque), void *opaque);
+#endif
 void *tl_jni_vm(void);
 void *tl_jni_env(void);
 

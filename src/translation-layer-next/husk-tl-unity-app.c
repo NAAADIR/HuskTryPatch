@@ -43,6 +43,7 @@ static char g_geode_zip[1024], g_geode_launcher[1024];
 #include "husk-tl-gamemaker.h"
 #include "husk-tl-dvm.h"
 #include "husk-tl-dvm-javaapp.h"
+#include "husk-oop-launch.h"
 #include "husk-tl-aosp.h"
 #include "husk-tl-nativeactivity.h"
 #include "husk-tl-gtasa.h"
@@ -365,12 +366,22 @@ static void *launch_thread(void *arg)
     } else if (A.engine == ENGINE_JAVA) {
         tl_log_line("java: starting %s as %s, %dx%d (runtime %s)", A.apk, A.package, A.width, A.height, g_java_root);
         ok = false;
-        if (g_java_root[0]) {
+        bool oop_ready = true;
+#ifdef HUSK_OOP_IOS_DIAG
+        /* Opt-in out-of-place execution (HUSK_OOP_GAME=1): the image is mapped before the runtime loads any library. If it was
+           asked for and cannot be prepared, the launch fails here -- it never quietly runs the game in place instead. */
+        if (husk_oop_launch_requested()) {
+            char why[200] = "";
+            oop_ready = husk_oop_launch_prepare(A.apk, A.angle, NULL, why, sizeof(why));
+            tl_log_line("oop: out-of-place launch %s%s%s", oop_ready ? "prepared" : "unavailable: ", oop_ready ? "" : why, "");
+        }
+#endif
+        if (oop_ready && g_java_root[0]) {
             pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 64u << 20);
             pthread_t t;
             if (pthread_create(&t, &at, java_boot, &ok) == 0) pthread_join(t, NULL);
             pthread_attr_destroy(&at);
-        } else tl_log_line("java: no runtime folder given");
+        } else if (oop_ready) tl_log_line("java: no runtime folder given");
         if (ok) {
             tl_audio_install();
             char fwres[1100];

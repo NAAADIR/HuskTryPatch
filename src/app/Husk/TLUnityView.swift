@@ -346,6 +346,13 @@ final class TLUnityUIView: UIView, UIKeyInput {
                 husk_java_set_insets(Int32(inset.left * k), Int32(inset.top * k), Int32(inset.right * k), Int32(inset.bottom * k), 0)
             }
             attachWebHost(fresh: true)
+#if HUSK_OOP_IOS_DIAG
+            // Opt-in out-of-place backend (Settings > Developer Diagnostic): selected only with JIT; never a silent fallback.
+            if UserDefaults.standard.bool(forKey: "huskOOPGame") {
+                if JITBootstrap.prewarm() { setenv("HUSK_OOP_GAME", "1", 1) }
+                else { HuskLog.log("oop", "out-of-place launch requested but JIT is unavailable: not launching"); started = false; break }
+            } else { unsetenv("HUSK_OOP_GAME") }
+#endif
             started = husk_java_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         case .gamemaker: started = husk_gamemaker_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         case .flutter:

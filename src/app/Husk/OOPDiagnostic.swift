@@ -8,9 +8,13 @@ struct OOPDiagnosticSection: View {
     @State private var result: String?
     @State private var realResult: String?
     @State private var testingReal = false
+    /// Opt-in: the next Brave Frontier V20 launch runs libgame.so out of place (husk-oop-launch.c).
+    @AppStorage("huskOOPGame") private var oopGame = false
 
     var body: some View {
         Section("Developer Diagnostic") {
+            Toggle("Run Brave Frontier V20 out of place", isOn: $oopGame)
+            if oopGame { Text("Next launch only uses the out-of-place backend; it fails rather than run in place. Restart Husk first.").font(.footnote) }
             Button("Run out-of-place ARM64 test") {
                 guard !runner.isRunning, JITBootstrap.prewarm() else {
                     husk_oop_ios_preflight_fail(0)

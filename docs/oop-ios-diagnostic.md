@@ -46,7 +46,9 @@ is retained until process exit because `tl_xmem` cannot free a bump allocation.
 It is deliberately unavailable if a native app or the console arena is active.
 
 This checks guest addresses, controlled BL/BLR/RET and one host-call signature;
-it is single-threaded and uses checked fallback for memory and control flow.
+it is single-threaded and uses checked fallback for memory and conditional control flow.
+Unconditional guest transfers are lowered to native state updates and return to
+the checked dispatcher; they do not directly execute a guest address.
 It is not a general Android ABI, signal, permission, or self-modifying-code
 implementation. Neither an iOS compile nor a device result has been observed
 until the corresponding check is actually run.

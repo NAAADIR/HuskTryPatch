@@ -978,6 +978,16 @@ void *tl_bionic_find(const char *name)
     return NULL;
 }
 
+#ifdef HUSK_OOP_IOS_DIAG
+/* Diagnostic builds: which guest import a host address answers (out-of-place stops name the missing adapter). */
+const char *tl_bionic_name_of(const void *addr)
+{
+    pthread_once(&g_once, build);
+    for (size_t i = 0; i < (size_t)g_nslots; i++) if (g_slots[i].name && g_slots[i].addr == addr) return g_slots[i].name;
+    return NULL;
+}
+#endif
+
 bool tl_bionic_is_system_lib(const char *soname)
 {
     static const char *const sys[] = {

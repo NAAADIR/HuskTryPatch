@@ -104,8 +104,13 @@ int husk_oop_real_run(const char *apk,const char *egl,const char *gles)
     CHECK(tl_xmem_open(192u<<20,err,sizeof(err)) && tl_xmem_size()-tl_xmem_used()>=(64u<<20) &&
           tl_xmem_alloc(16384,&cache_rx,&cache_rw),"allocator_unavailable");
     passed[ALLOC]=true;
+    size_t before_images=tl_xmem_used();
+    fprintf(stderr,"HUSK-OOP-REAL xmem_region_bytes=%zu xmem_before_images_bytes=%zu cache_bytes=16384\n",
+            tl_xmem_size(),before_images);
     CHECK(egl && tl_egl_init(egl,gles,NULL,0),"angle_unavailable");
     bool loaded=tl_ld_oop_real_open(game,42564848,cpp,919888,&lib,&dep,&phase,&missing);
+    fprintf(stderr,"HUSK-OOP-REAL xmem_after_images_bytes=%zu image_allocations_bytes=%zu\n",
+            tl_xmem_used(),tl_xmem_used()-before_images);
     passed[ELF]=phase>=1; passed[DEPS]=phase>=2; unresolved=phase>=2?(int)missing:-1;
     CHECK(loaded,phase==0?"elf_load":phase==1?"dependency_unsupported":missing?"unresolved_imports":"relocation_failed"); passed[RELOCS]=true;
     CHECK(tl_ld_oop_test_views(lib,&guest,&write,&size) && size>=0x29c1000 && !tl_ld_init(lib) &&
@@ -130,7 +135,7 @@ int husk_oop_real_run(const char *apk,const char *egl,const char *gles)
     bb_state s=initial((uintptr_t)id);
     CHECK(run(engine,&s) && s.x[0]==(uintptr_t)guest+0x2337826 && compare(engine,s.x[0],16),"request_id");
     s=initial((uintptr_t)xml); CHECK(run(engine,&s) && s.x[0]==slot,"relocated_load");
-    stats=bb_get_stats(engine); CHECK(stats.native_blocks==2 && stats.native_instructions==3 && stats.interpreted_instructions==3,"execution_coverage");
+    stats=bb_get_stats(engine); CHECK(stats.native_blocks==4 && stats.native_instructions==5 && stats.interpreted_instructions==1,"execution_coverage");
     void *getter=tl_ld_sym(lib,"_ZN10BattleUnit17getBattleTreasureEv");
     CHECK(getter==guest+0x1124fd0,"getter_symbol"); uint32_t insn; memcpy(&insn,getter,4); CHECK(insn==0xf942cc00,"getter_opcode");
     uintptr_t addr=(uintptr_t)guest+0x29c0000-4; uint8_t saved[8]; uint64_t value=UINT64_C(0x9ac30d71e528b46f);
@@ -139,8 +144,9 @@ int husk_oop_real_run(const char *apk,const char *egl,const char *gles)
     s=initial((uintptr_t)getter); s.x[0]=addr-(((insn>>10)&4095)*8);
     CHECK(run(engine,&s) && s.x[0]==value && bb_write(engine,addr,saved,8) && compare(engine,addr,8),"boundary_load"); passed[PAGE]=true;
     void *fp=tl_ld_sym(lib,"_ZN12SandbagScene20checkUnitStatusBonusEv");
-    CHECK(fp==guest+0x15c51f0,"unsupported_symbol"); memcpy(&insn,fp,4); CHECK(insn==0x1e2703e0,"unsupported_opcode");
-    s=initial((uintptr_t)fp); CHECK(bb_run(engine,&s,0xfeed0000,100)==BB_UNSUPPORTED && s.pc==(uintptr_t)fp,"unsupported_instruction");
+    CHECK(fp==guest+0x15c51f0,"fmov_symbol"); memcpy(&insn,fp,4); CHECK(insn==0x1e2703e0,"fmov_opcode");
+    s=initial((uintptr_t)fp); s.v[0][0]=s.v[0][1]=UINT64_MAX;
+    CHECK(bb_run(engine,&s,(uintptr_t)fp+4,1)==BB_STOP && !s.v[0][0] && !s.v[0][1],"fmov_instruction");
     passed[NATIVE]=true;
     CHECK(!memcmp(guest,game,0x26ca520),"code_modified"); passed[CODE]=true;
     error=NULL;

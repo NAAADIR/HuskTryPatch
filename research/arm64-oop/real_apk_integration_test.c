@@ -36,6 +36,13 @@ static vm_prot_t protection(void *ptr) {
 }
 static bb_state state(uint64_t pc) { bb_state s={0}; s.pc=pc; s.x[30]=0xfeed0000; s.nzcv=0xa0000000; return s; }
 static void run(bb_engine *e, bb_state *s) { assert(bb_run(e,s,0xfeed0000,100)==BB_STOP); assert(s->pc==0xfeed0000 && s->x[30]==0xfeed0000 && s->nzcv==0xa0000000); }
+typedef struct { tl_lib *owner; uintptr_t entry; unsigned calls; } blocked_init;
+static bool reject_unready_constructor(tl_lib *owner, uintptr_t entry, int argc, char **argv, char **envp, void *opaque) {
+    blocked_init *b=opaque;
+    assert(owner && entry && argc==1 && argv && envp);
+    b->owner=owner; b->entry=entry; b->calls++;
+    return false; /* Do not execute before guest stack, TLS and imports exist. */
+}
 int main(int argc, char **argv) {
     assert(argc==5 && sysconf(_SC_PAGESIZE)==16384);
     assert(tl_egl_init(argv[3],argv[4],NULL,0)); assert(tl_ld_add_apk(argv[1]));
@@ -64,7 +71,7 @@ int main(int argc, char **argv) {
     compare(e,(uintptr_t)entry,12);
     bb_state s=state((uintptr_t)entry); run(e,&s);
     assert(s.x[0]==(uintptr_t)guest+0x2337826); compare(e,s.x[0],16);
-    bb_stats stats=bb_get_stats(e); assert(stats.native_blocks==1 && stats.interpreted_instructions==1);
+    bb_stats stats=bb_get_stats(e); assert(stats.native_blocks==2 && stats.interpreted_instructions==0);
     /* This real leaf loads a GLOB_DAT slot, relocated to a real game BSS symbol. */
     void *xml=tl_ld_sym(lib,"__xmlStructuredErrorContext");
     void *target=tl_ld_sym(lib,"xmlStructuredErrorContext");
@@ -76,7 +83,7 @@ int main(int argc, char **argv) {
     uint64_t external=0; assert(bb_read(e,(uintptr_t)guest+0x26ed848,&external,8));
     assert(external==(uintptr_t)vtable+16); compare(e,(uintptr_t)guest+0x26ed848,8);
     s=state((uintptr_t)xml); run(e,&s); assert(s.x[0]==got);
-    stats=bb_get_stats(e); assert(stats.native_blocks==2 && stats.interpreted_instructions==3);
+    stats=bb_get_stats(e); assert(stats.native_blocks==4 && stats.interpreted_instructions==1);
     printf("two real functions: %zu native blocks, %zu checked instructions\n",stats.native_blocks,stats.interpreted_instructions);
     /* A second real getter reads an unaligned 8-byte value across two 16 KiB host pages. */
     void *getter=tl_ld_sym(lib,"_ZN10BattleUnit17getBattleTreasureEv"); assert(getter==guest+0x1124fd0);
@@ -84,16 +91,26 @@ int main(int argc, char **argv) {
     uintptr_t boundary=(uintptr_t)guest+0x29c0000, addr=boundary-4;
     unsigned char saved[8]; assert(bb_read(e,addr,saved,8));
     uint64_t value=UINT64_C(0x9ac30d71e528b46f);
-    stats=bb_get_stats(e); assert(bb_write(e,addr,&value,8)); assert(bb_get_stats(e).invalidations>stats.invalidations);
+    /* A write to a data (BSS) page cannot make translated code stale: no invalidation (code-page writes still invalidate, block suite). */
+    stats=bb_get_stats(e); assert(bb_write(e,addr,&value,8)); assert(bb_get_stats(e).invalidations==stats.invalidations);
     compare(e,addr,8);
     s=state((uintptr_t)getter); s.x[0]=addr-(((insn>>10)&4095)*8); run(e,&s); assert(s.x[0]==value);
     assert(bb_write(e,addr,saved,8)); compare(e,addr,8);
-    /* A real function's FMOV is outside this engine's implemented FP subset. */
+    /* Execute the real function's first FMOV without entering the function. */
     void *fp=tl_ld_sym(lib,"_ZN12SandbagScene20checkUnitStatusBonusEv"); assert(fp==guest+0x15c51f0);
     uint32_t fpinsn; memcpy(&fpinsn,fp,4); assert(fpinsn==0x1e2703e0);
-    s=state((uintptr_t)fp); assert(bb_run(e,&s,0xfeed0000,100)==BB_UNSUPPORTED && s.pc==(uintptr_t)fp);
+    s=state((uintptr_t)fp); s.v[0][0]=s.v[0][1]=UINT64_MAX;
+    assert(bb_run(e,&s,(uintptr_t)fp+4,1)==BB_STOP && !s.v[0][0] && !s.v[0][1]);
     assert(!memcmp(guest,original,textsz));
+    /* Exercise the real loader's dependency-order routing against the real
+     * APK, but stop before entering a constructor with missing prerequisites. */
+    blocked_init first={0};
+    assert(!tl_ld_init_routed(lib,reject_unready_constructor,&first));
+    assert(first.calls==1 && first.owner==cpp && first.entry>=(uintptr_t)tl_ld_lib_base(cpp));
+    uintptr_t offset=first.entry-(uintptr_t)tl_ld_lib_base(cpp);
+    assert(offset<0x100000 && !tl_ld_init_routed(lib,reject_unready_constructor,&first) && first.calls==1);
+    printf("real APK loader: blocked at libc++_shared.so constructor +%#lx before execution; no retry: PASS\n",(unsigned long)offset);
     puts("real relocated game: leaf, relocated GLOB_DAT load, 16 KiB crossing guest load and process_vm_readv: PASS");
-    puts("original executable LOAD preserved; separate W^X cache; unsupported real FP instruction rejected: PASS");
+    puts("original executable LOAD preserved; separate W^X cache; real FMOV executed: PASS");
     bb_destroy(e); free(original); return 0;
 }

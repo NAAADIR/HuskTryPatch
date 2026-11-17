@@ -31,7 +31,7 @@ for section in sections:
 if matches != [(0x13a50b8, 12)]: raise SystemExit('unexpected game leaf symbol')
 print('verified InitializeRequest::getRequestID symbol and extent')
 PY
-clang -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-unused-function -ffunction-sections -fdata-sections \
+clang -std=gnu11 -O2 -DBB_TESTING -Wall -Wextra -Werror -Wno-unused-function -ffunction-sections -fdata-sections \
  -Isrc/translation-layer -Isrc/translation-layer-next research/arm64-oop/block_engine.c \
  research/arm64-oop/arm64_oop.c research/arm64-oop/block_test.c research/arm64-oop/process_read_helper.c \
  -Wl,-dead_strip -Wl,-undefined,dynamic_lookup -o "$tmp/test"

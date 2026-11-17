@@ -67,6 +67,14 @@ void tl_ld_add_search_dir(const char *dir);
 
 /* Run constructors for a library and anything it needs that has not run. */
 bool tl_ld_init(tl_lib *lib);
+#if defined(HUSK_OOP_DOMAIN_TEST) || defined(HUSK_OOP_IOS_DIAG)
+/* Experimental constructor routing for unpatched OOP images only. The caller
+ * owns the execution domain, guest stack, TLS and any argv/envp marshalling.
+ * Returning false permanently fails this library and its dependent init. */
+typedef bool (*tl_ld_init_gate)(tl_lib *owner, uintptr_t entry, int argc,
+                                char **argv, char **envp, void *opaque);
+bool tl_ld_init_routed(tl_lib *lib, tl_ld_init_gate gate, void *opaque);
+#endif
 /* After that library's constructors: Unity installs IL2CPP's terminate handler here, because
  * NativeLoader.load often returns before libil2cpp.so exists. */
 void tl_ld_on_init(void (*fn)(tl_lib *lib));
@@ -185,3 +193,11 @@ void tl_ld_mark_svcs(void *addr, size_t len);
 #endif
 
 #endif /* HUSK_TL_LD_H */
+
+#if defined(HUSK_OOP_IOS_DIAG) && !defined(HUSK_TL_LD_OOP_DATA_IMPORTS)
+#define HUSK_TL_LD_OOP_DATA_IMPORTS
+/* Data imports (STT_OBJECT, GLOB_DAT/ABS64) of an out-of-place image that the loader bound to host objects: the guest
+   dereferences these slots itself, so the OOP layer rebinds those it can give a guest-resident copy. */
+typedef struct { uint64_t slot, host, addend, size; char name[64]; } tl_ld_oop_data_import;
+size_t tl_ld_oop_data_imports(const tl_ld_oop_data_import **out);
+#endif

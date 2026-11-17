@@ -1101,6 +1101,15 @@ static void mangle(const char *s, char *out, size_t n, bool sig)
 }
 
 unsigned tl_jni_natives_generation(void);
+#ifdef HUSK_OOP_IOS_DIAG
+static tl_dvm_foreign_resolve_fn g_foreign_resolve;
+static tl_dvm_foreign_call_fn g_foreign_call;
+static void *g_foreign_opaque;
+void tl_dvm_set_foreign_natives(tl_dvm_foreign_resolve_fn resolve, tl_dvm_foreign_call_fn call, void *opaque)
+{
+    g_foreign_opaque = opaque; g_foreign_call = call; g_foreign_resolve = resolve;
+}
+#endif
 static void *find_jni(dvm_method *m)
 {
     /* cached until the next RegisterNatives: Dex2C-protected apps register a class's natives from its <clinit>, which can come after
@@ -1120,7 +1129,18 @@ static void *find_jni(dvm_method *m)
             snprintf(sym, sizeof(sym), "Java_%s_%s__%s", cls, nm, sg);
             fn = tl_ld_sym(NULL, sym);
         }
+#ifdef HUSK_OOP_IOS_DIAG
+        /* last: only what Husk registered and the published libraries do not have */
+        m->jni_foreign = false;
+        if (!fn && g_foreign_resolve) {
+            char shortsym[1100]; snprintf(shortsym, sizeof(shortsym), "Java_%s_%s", cls, nm);
+            if ((fn = g_foreign_resolve(g_foreign_opaque, shortsym)) || (fn = g_foreign_resolve(g_foreign_opaque, sym))) m->jni_foreign = true;
+        }
+#endif
     }
+#ifdef HUSK_OOP_IOS_DIAG
+    else m->jni_foreign = false;
+#endif
     if (!fn && !m->jni_looked)
         tl_log_line("dvm: no native found for %s.%s%s (registrations so far: %u)", m->cls->name, m->name, m->sig, gen);
     m->jni = fn;
@@ -1190,6 +1210,18 @@ static bool call_native(dvm_method *m, jobj *self, const jvalue *params, jvalue 
         return dvm_throw("java/lang/UnsatisfiedLinkError", "No implementation found for %s.%s%s", m->cls->name, m->name, m->sig);
     }
     if (g_dvm_trace >= 2) tl_log_line("dvm: jni %s.%s%s", m->cls->name, m->name, m->sig);
+#ifdef HUSK_OOP_IOS_DIAG
+    if (m->jni_foreign) {
+        if (m->critical == 0) { bool dvm_method_annotated_build(dvm_method *, const char *); m->critical = (m->flags & 8) && dvm_method_annotated_build(m, "Ldalvik/annotation/optimization/CriticalNative;") ? 1 : -1; }
+        if (m->critical > 0 || !g_foreign_call)
+            return dvm_throw("java/lang/UnsatisfiedLinkError", "out-of-place native unsupported: %s.%s%s", m->cls->name, m->name, m->sig);
+        jvalue r; r.j = 0;
+        bool ok = g_foreign_call(g_foreign_opaque, fn, m->shorty, (m->flags & 8) ? m->cls->jc->mirror : self, params, m->nparams, &r);
+        if (ret) *ret = r;
+        if (ok && ret && m->shorty[0] == 'L' && ret->l) ((jobj *)ret->l)->refs = 1u << 30;
+        return ok && !tl_jni_pending();
+    }
+#endif
     if (tl_a32_is_fn(fn)) return tl_a32_jni_native(fn, m, self, params, ret);
     int64_t gp[8]; double fp[8]; int64_t stk[256];
     int ng = 0, nf = 0, ns = 0;
@@ -2140,7 +2172,16 @@ bool tl_dvm_start(const char *const *boot, int nboot)
 
 bool tl_dvm_defines_class(const char *jni_name) { return jni_name && cdef_find(jni_name) != NULL; }
 
-bool tl_dvm_add_apk(const char *apk) { return open_path(apk); }
+/* An APK already opened is not opened again: a second add (a launcher that adds the app the host already added) would define a
+ * second copy of every class's DEX. Reset by tl_dvm_drop_app. */
+static char *g_added_apk[16]; static int g_nadded_apk;
+bool tl_dvm_add_apk(const char *apk)
+{
+    for (int i = 0; i < g_nadded_apk; i++) if (!strcmp(g_added_apk[i], apk)) return true;
+    if (!open_path(apk)) return false;
+    if (g_nadded_apk < 16) g_added_apk[g_nadded_apk++] = strdup(apk);
+    return true;
+}
 
 /* ---- the app's class loader: what Class.getClassLoader says for the app's own classes (a PathClassLoader over its APKs, made by
  * husk.AppRunner), so code that reads resources through its class's loader, or checks a class came from its own loader, works */
@@ -2220,6 +2261,8 @@ void tl_dvm_drop_app(void)
     g_app_loader = NULL;
     for (int i = g_nboot_cp; i < g_ncp; i++) free(g_cp[i]);
     g_ncp = g_nboot_cp;
+    for (int i = 0; i < g_nadded_apk; i++) free(g_added_apk[i]);
+    g_nadded_apk = 0;
     pthread_mutex_lock(&g_open_lock);
     int w = 0;
     for (int i = 0; i < g_nopened; i++) {

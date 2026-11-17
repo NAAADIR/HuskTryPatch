@@ -119,7 +119,7 @@ struct tl_lib {
     size_t n_ctr;                  /* reads of CTR_EL0 replaced by a constant */
     size_t n_svc_far, n_adr_failed;   /* svc sites with no stub in branch range (answered ENOSYS), adr sites that could not be rewritten */
     size_t n_x18, n_x18_failed;    /* sites rewritten for the reserved register, and sites that could not be */
-    int state;                     /* 0 mapped, 1 relocating, 2 relocated, 3 initialising, 4 initialised */
+    int state;                     /* -1 init failed; 0 mapped, 1 relocating, 2 relocated, 3 initialising, 4 initialised */
     uint32_t n_unresolved;
     size_t n_reloc_code;           /* imported: relocations that name a code page, which a dylib maps read-only, so were not applied */
     bool system;                   /* from the runtime's own folders (an APEX's lib64), not the app: what it needs comes from there too */
@@ -147,6 +147,10 @@ struct tl_lib {
 /* Protected by g_big; only the dedicated diagnostic APIs set these. */
 static bool g_oop_mapping;
 static bool g_oop_real_mapping;
+#ifdef HUSK_OOP_IOS_DIAG
+static tl_ld_oop_data_import g_oop_data[64]; static size_t g_oop_data_n;
+size_t tl_ld_oop_data_imports(const tl_ld_oop_data_import **out) { if (out) *out = g_oop_data; return g_oop_data_n; }
+#endif
 static void *g_oop_host;
 #endif
 static inline bool data_page(const tl_lib *L, size_t page);
@@ -2053,6 +2057,23 @@ static bool reloc_one_into(tl_lib *L, uint64_t r_offset, uint32_t type, uint32_t
         uint64_t v = bind_symbol(L, symidx, &failed);
         if (failed) return false;
         if (v == 1 && L->symcache) v = 0;
+#ifdef HUSK_OOP_IOS_DIAG
+        /* An out-of-place image's data import bound to a host object: guest code dereferences the slot directly, so the
+           OOP layer must give it a guest-resident binding (tl_ld_oop_data_imports). Recorded, not changed, here. */
+        if (OOP_REAL_LIB(L) && type != R_JUMP_SLOT && v) {
+            const elf_sym *ds = sym_at(L, symidx);
+            /* only a host object: one the image or its out-of-place dependencies define is already guest memory */
+            bool guest = v >= (uint64_t)(uintptr_t)L->rx && v < (uint64_t)(uintptr_t)L->rx + L->npages * PAGE;
+            for (int k = 0; !guest && k < L->ndeps; k++) { tl_lib *d = L->deps[k];
+                guest = d && d->rx && v >= (uint64_t)(uintptr_t)d->rx && v < (uint64_t)(uintptr_t)d->rx + d->npages * PAGE; }
+            if (!guest && ds && ds->st_shndx == 0 && (ds->st_info & 0xf) == 1 /* STT_OBJECT */ && g_oop_data_n < 64) {
+                g_oop_data[g_oop_data_n].slot = image_addr(L, r_offset); g_oop_data[g_oop_data_n].host = v;
+                g_oop_data[g_oop_data_n].addend = type == R_ABS64 ? (uint64_t)addend : 0; g_oop_data[g_oop_data_n].size = ds->st_size;
+                snprintf(g_oop_data[g_oop_data_n].name, sizeof(g_oop_data[0].name), "%s", sym_name(L, ds));
+                g_oop_data_n++;
+            }
+        }
+#endif
         if (!OOP_REAL_LIB(L) && type != R_ABS64)
             v = bf_diag_relocation(L, sym_at(L, symidx), sym_name(L, sym_at(L, symidx)), type, v);
         else if (!OOP_REAL_LIB(L))
@@ -3188,6 +3209,15 @@ bool tl_ld_oop_test_views(tl_lib *L, uint8_t **guest, uint8_t **write, size_t *s
     if (!L || !OOP_TEST_LIB(L) || L->state != 2 || L->aot || L->dup || !guest || !write || !size) return false;
     *guest = L->rx; *write = L->rw; *size = L->npages * PAGE; return true;
 }
+/* The loader already creates this thread block. Return both aliases so an
+ * isolated OOP thread can use its canonical guest address. */
+bool tl_ld_oop_test_tcb(tl_lib *L, uint8_t **guest, uint8_t **write)
+{
+    if (!L || !OOP_TEST_LIB(L) || L->state != 2 || !L->tcb || !guest || !write) return false;
+    size_t off = (size_t)(L->tcb - L->rw);
+    if (off >= L->size || L->size - off < PAGE) return false;
+    *guest = L->rx + off; *write = L->tcb; return true;
+}
 #endif
 
 #ifdef HUSK_OOP_IOS_DIAG
@@ -3393,26 +3423,41 @@ tl_lib *tl_ld_load(const char *name)
     return L;
 }
 
-static bool init_locked(tl_lib *L)
+typedef bool (*init_gate_fn)(tl_lib *, uintptr_t, int, char **, char **, void *);
+
+static bool init_locked(tl_lib *L, init_gate_fn gate, void *opaque)
 {
-    if (!L || L->state >= 3) return true;
+    if (!L) return true;
+    /* A routed image must never silently fall back to direct execution. */
+    if (gate && (!OOP_TEST_LIB(L) || !OOP_REAL_LIB(L) || L->arm32 || L->aot || L->dup || L->tls_id)) return false;
+    if (L->state >= 3) return true;
     if (L->state < 2) return false;
     L->state = 3;
     if (L->arm32) {
-        for (int i = L->ndeps - 1; i >= 0; i--) init_locked(L->deps[i]);
-        return tl_a32_init(L);
+        for (int i = L->ndeps - 1; i >= 0; i--) if (!init_locked(L->deps[i], gate, opaque)) { L->state = -1; return false; }
+        if (!tl_a32_init(L)) { L->state = -1; return false; }
+        return true;
     }
     build_scope(L);
     /* Needed libraries initialise first, in the order the linker would run them: the
      * deepest dependency first. The BFS list is shallowest-first, so walk it backwards. */
-    for (int i = L->ndeps - 1; i >= 0; i--) init_locked(L->deps[i]);
+    for (int i = L->ndeps - 1; i >= 0; i--) {
+        if (!init_locked(L->deps[i], gate, opaque)) { L->state = -1; return false; }
+    }
 
     char *fallback_argv[] = { (char *)"app_process64", NULL };
     char *fallback_envp[] = { NULL };
     char **argv = G.argv ? G.argv : fallback_argv, **envp = G.envp ? G.envp : fallback_envp;
     int argc = 1;
     typedef void (*init_fn)(int, char **, char **);
-    if (L->init) ((init_fn)(L->rx + (L->init - L->base_vaddr)))(argc, argv, envp);
+    if (L->init) {
+        uintptr_t f = (uintptr_t)(L->rx + (L->init - L->base_vaddr));
+        if (gate) {
+            if (!gate(L, f, argc, argv, envp, opaque)) {
+                tl_log_line("ld: %s: routed DT_INIT failed", L->name); L->state = -1; return false;
+            }
+        } else ((init_fn)f)(argc, argv, envp);
+    }
     if (L->init_array) {
         const uint64_t *fns = at(L, L->init_array);
         size_t n = L->init_arraysz / 8;
@@ -3426,7 +3471,12 @@ static bool init_locked(tl_lib *L)
             /* TL_INIT_BREAK=<library>: a debugger stops here with the constructor's address in x0 and the image base in x1 */
             { const char *b = getenv("TL_INIT_BREAK");
               if (b && !strcmp(b, L->name)) __asm__ volatile("mov x0, %0\n mov x1, %1\n brk #0xf00d" :: "r"(f), "r"((uint64_t)(uintptr_t)L->rx) : "x0", "x1"); }
-            ((init_fn)(uintptr_t)f)(argc, argv, envp);
+            if (gate) {
+                if (!gate(L, (uintptr_t)f, argc, argv, envp, opaque)) {
+                    tl_log_line("ld: %s: routed constructor %zu failed", L->name, i);
+                    L->state = -1; return false;
+                }
+            } else ((init_fn)(uintptr_t)f)(argc, argv, envp);
             if (trace) tl_log_line("ld: %s: constructor %zu returned", L->name, i);
         }
     }
@@ -3447,11 +3497,23 @@ bool tl_ld_init(tl_lib *lib)
     if (lib && lib->oop_real) return false;
 #endif
     pthread_mutex_lock(&g_big);
-    bool ok = init_locked(lib);
+    bool ok = init_locked(lib, NULL, NULL);
     pthread_mutex_unlock(&g_big);
     return ok;
 #endif
 }
+
+#if defined(HUSK_OOP_DOMAIN_TEST) || defined(HUSK_OOP_IOS_DIAG)
+bool tl_ld_init_routed(tl_lib *lib, tl_ld_init_gate gate, void *opaque)
+{
+    /* g_on_init is a native callback and may call guest pointers directly. */
+    if (!lib || !gate) return false;
+    pthread_mutex_lock(&g_big);
+    bool ok = !g_on_init && init_locked(lib, gate, opaque);
+    pthread_mutex_unlock(&g_big);
+    return ok;
+}
+#endif
 
 /* ------------------------------------------------------------ ahead of time */
 

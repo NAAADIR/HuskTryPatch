@@ -22,6 +22,6 @@ with zipfile.ZipFile(apk) as z, open(out, 'wb') as f: f.write(z.read('lib/arm64-
 print('V20 APK SHA-256 verified', flush=True)
 PY
 bash tools/regress/build.sh research/arm64-oop/real_apk_integration_test.c "$tmp/test" \
-    -DHUSK_OOP_LOADER_TEST -DHUSK_OOP_REAL_TEST -Iresearch/arm64-oop research/arm64-oop/block_engine.c \
+    -DHUSK_OOP_LOADER_TEST -DHUSK_OOP_REAL_TEST -DHUSK_OOP_DOMAIN_TEST -Iresearch/arm64-oop research/arm64-oop/block_engine.c \
     > "$tmp/build.log" 2>&1 || { cat "$tmp/build.log" >&2; exit 1; }
 "$tmp/test" "$apk" "$tmp/libgame.so" "$egl" "$gles"
