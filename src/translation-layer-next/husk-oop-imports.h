@@ -49,6 +49,10 @@ unsigned oop_imports_calls_named(const oop_imports *b, const char *name);
  * send/recv(from/to), poll/select, fcntl/ioctl (integer forms), getaddrinfo
  * (copied into the guest heap), inet_*, getnameinfo. */
 int oop_imports_register_net(oop_imports *b);
+/* Guest raw system calls (SVC #0), as the in-place backend's Linux layer
+ * serves them; process_vm_readv reads guest memory. Unknown calls stop. */
+int oop_imports_register_syscalls(oop_imports *b);
+unsigned oop_imports_syscall_count(long nr);
 /* The generic runtime family: guest heap (malloc/calloc/realloc/free, any
  * attached thread), pthread mutex/cond objects, syscall(gettid), arc4random,
  * sigfillset/sigdelset, getenv, strtoul, wcrtomb. */

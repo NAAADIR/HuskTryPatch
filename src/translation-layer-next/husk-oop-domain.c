@@ -205,6 +205,20 @@ static bool oop_bsearch_gate(const bb_state *s, uint64_t *result, void *opaque) 
         if (!r) { *result=base+mid*size; return true; } if (r<0) hi=mid; else lo=mid+1; }
     return true;
 }
+/* Guest Linux system calls (SVC #0): the callback gets the number (x8) and
+ * the arguments (x0-x5) and returns the Linux result (a value or -errno);
+ * false stops the guest. */
+static oop_syscall_fn g_syscall_fn; static void *g_syscall_opaque;
+static bool domain_svc(bb_state *s, void *opaque) {
+    (void)opaque; int64_t r;
+    if (!g_syscall_fn || !g_syscall_fn(s,(long)s->x[8],&r,g_syscall_opaque)) return false;
+    s->x[0]=(uint64_t)r; return true;
+}
+bool oop_domain_set_syscall(oop_domain *d, oop_syscall_fn fn, void *opaque) {
+    if (!d || !fn) return false;
+    g_syscall_opaque=opaque; g_syscall_fn=fn;
+    return bb_set_svc_handler(d->engine,domain_svc,d);
+}
 bool oop_domain_register_sort(oop_domain *d, uint64_t qsort_fn, uint64_t bsearch_fn) {
     return d && (!qsort_fn || oop_domain_register_host(d,qsort_fn,oop_qsort_gate,d)) && (!bsearch_fn || oop_domain_register_host(d,bsearch_fn,oop_bsearch_gate,d));
 }
@@ -284,6 +298,15 @@ bool oop_domain_register_host(oop_domain *d, uint64_t token, oop_host_callback f
     memmove(d->hosts+lo+1,d->hosts+lo,(d->host_count-lo)*sizeof(*d->hosts));
     d->hosts[lo]=(host_entry){token,fn,opaque}; ++d->host_count;
 out:
+    if (d->threaded) pthread_mutex_unlock(&d->reg_lock);
+    return r;
+}
+bool oop_domain_host_registered(oop_domain *d, uint64_t token) {
+    if (!d) return false;
+    if (d->threaded) pthread_mutex_lock(&d->reg_lock);
+    size_t lo=0,hi=d->host_count;
+    while (lo<hi) { size_t m=lo+(hi-lo)/2; if (d->hosts[m].token<token) lo=m+1; else hi=m; }
+    bool r=lo<d->host_count && d->hosts[lo].token==token;
     if (d->threaded) pthread_mutex_unlock(&d->reg_lock);
     return r;
 }

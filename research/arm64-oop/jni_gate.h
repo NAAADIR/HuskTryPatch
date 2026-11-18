@@ -263,7 +263,25 @@ static bool jni_ret_fp(jni_gate *j,char k,jvalue v);
 /* Generic Call[Static]<T>Method{V,A}. Dispatch goes through Husk's own
  * Call<T>MethodA, so the method runs as production runs it: an installed
  * host implementation, otherwise the Dalvik interpreter's bytecode. */
-static bool jni_call_gate(const bb_state *s,uint64_t *result,jni_gate *j,bool is_static,unsigned t,bool a_form) {
+/* C variadic arguments after the method ID (AAPCS64): integers and pointers
+ * continue in x3-x7, float/double (promoted to double) in v0-v7, the rest in
+ * 8-byte slots from the caller's SP; everything is read from guest state. */
+static bool jni_decode_variadic(jni_gate *j,const jni_thread *t,const tl_jmeth *m,const bb_state *s,jvalue *args) {
+    if (m->nargs<0 || m->nargs>40) return false;
+    unsigned gi=3, vi=0; uint64_t stack=s->sp;
+    for (int i=0;i<m->nargs;i++) { uint64_t raw; bool fp=m->argk[i]=='F' || m->argk[i]=='D';
+        if (!fp && gi<8) raw=s->x[gi++];
+        else if (fp && vi<8) raw=s->v[vi++][0];
+        else { if (!bb_read(j->engine,stack,&raw,8)) return false; stack+=8; }
+        if (!jni_arg(j,t,m->argk[i],raw,fp,&args[i])) return false; }
+    static _Atomic unsigned logged;
+    if (atomic_fetch_add(&logged,1)<32) { void tl_log_line(const char *, ...);
+        tl_log_line("oop: guest JNI %s %s.%s%s (variadic)",m->is_static?"static":"instance",m->cls&&m->cls->name?m->cls->name:"?",m->name,m->sig); }
+    return true;
+}
+/* form: 0 = va_list (…V), 1 = jvalue array (…A), 2 = C variadic (…). */
+static bool jni_call_gate(const bb_state *s,uint64_t *result,jni_gate *j,bool is_static,unsigned t,int form) {
+    bool a_form=form==1;
     void *target; tl_jmeth *m; jvalue args[40]; jni_thread *th=jni_thread_of(j,s); void *env=jni_host_env(j);
     if (!th || !env || t>=10) return false;
     if (!jni_method_get(j,s->x[2],&m)) return jni_refuse(j,NULL,"unknown method token");
@@ -278,6 +296,8 @@ static bool jni_call_gate(const bb_state *s,uint64_t *result,jni_gate *j,bool is
         if (m->nargs && (!s->x[3] || !bb_access(j->engine,s->x[3],(size_t)m->nargs*8,BB_R))) return false;
         for (int i=0;i<m->nargs;i++) { uint64_t raw;
             if (!bb_read(j->engine,s->x[3]+(uint64_t)i*8,&raw,8) || !jni_arg(j,th,m->argk[i],raw,false,&args[i])) return jni_refuse(j,m,"argument"); }
+    } else if (form==2) {
+        if (!jni_decode_variadic(j,th,m,s,args)) return jni_refuse(j,m,"argument");
     } else {
         jni_guest_va va;
         if (!s->x[3] || !bb_read(j->engine,s->x[3],&va,sizeof(va))) return false;
@@ -315,10 +335,12 @@ static bool jni_call_gate(const bb_state *s,uint64_t *result,jni_gate *j,bool is
     *result=r; return true;
 }
 #define JNI_CALL_GATES(T,I) \
-    static bool jni_call_v_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,false,I,false); } \
-    static bool jni_call_a_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,false,I,true); } \
-    static bool jni_scall_v_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,true,I,false); } \
-    static bool jni_scall_a_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,true,I,true); }
+    static bool jni_call_v_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,false,I,0); } \
+    static bool jni_call_a_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,false,I,1); } \
+    static bool jni_call_c_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,false,I,2); } \
+    static bool jni_scall_v_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,true,I,0); } \
+    static bool jni_scall_a_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,true,I,1); } \
+    static bool jni_scall_c_##T(const bb_state *s,uint64_t *r,void *p) { return jni_call_gate(s,r,p,true,I,2); }
 JNI_CALL_GATES(L,0) JNI_CALL_GATES(Z,1) JNI_CALL_GATES(B,2) JNI_CALL_GATES(C,3) JNI_CALL_GATES(S,4)
 JNI_CALL_GATES(I,5) JNI_CALL_GATES(J,6) JNI_CALL_GATES(F,7) JNI_CALL_GATES(D,8) JNI_CALL_GATES(V,9)
 #undef JNI_CALL_GATES
@@ -467,10 +489,11 @@ static bool jni_ext_gate(const bb_state *s,uint64_t *result,void *opaque) {
         jni_release_frame(j,t,t->frame); --t->frame;
         return jni_ref_put(j,t,keep,false,result); }
     case 26: /* EnsureLocalCapacity */ return (int32_t)x[1]>=0;
-    case 29: case 30: { /* NewObjectV / NewObjectA */
+    case 28: case 29: case 30: { /* NewObject (C variadic) / NewObjectV / NewObjectA */
         tl_jmeth *m; jvalue args[40];
         if (tl_jni_pending() || !jni_ref_lookup(j,t,x[1],&a) || !a || !jni_method_get(j,x[2],&m) || m->is_static ||
-            strcmp(m->name,"<init>") || (!m->fn && !(m->dvm && tl_dvm)) || !jni_decode_args(j,t,m,x[3],slot==30,args)) return false;
+            strcmp(m->name,"<init>") || (!m->fn && !(m->dvm && tl_dvm)) ||
+            !(slot==28?jni_decode_variadic(j,t,m,s,args):jni_decode_args(j,t,m,x[3],slot==30,args))) return false;
         jni_enter(j); void *o=((void *(*)(void *,void *,void *,const jvalue *))j->env_fns[30])(env,a,m,args); jni_leave(j);
         return jni_ref_put(j,t,o,false,result); }
     case 94: case 144: { /* GetFieldID / GetStaticFieldID */
@@ -585,7 +608,7 @@ static bool jni_ext_gate(const bb_state *s,uint64_t *result,void *opaque) {
     return false;
 }
 static bool jni_register_ext(jni_gate *j) {
-    static const unsigned single[]={10,11,16,19,20,24,26,29,30,32,94,144,164,168,171,172,173,174,219,220};
+    static const unsigned single[]={10,11,16,19,20,24,26,28,29,30,32,94,144,164,168,171,172,173,174,219,220};
     for (size_t i=0;i<sizeof(single)/sizeof(single[0]);i++)
         if (j->env_fns[single[i]] && !oop_domain_register_host(j->domain,JNI_ENV_TOKEN_BASE+single[i]*4,jni_ext_gate,j)) return false;
     for (unsigned s=175;s<=214;s++)
@@ -667,7 +690,33 @@ static void *jni_foreign_resolve(void *opaque,const char *symbol) {
     pthread_mutex_unlock(&j->lock);
     return p;
 }
+/* First-fault report for a stopped Java-to-guest native: the stopping guest
+ * PC, what it names (a guest image offset, or the host import it reached),
+ * the return address, the instruction word when the PC is guest code, and
+ * the argument registers. The engine does not record a data fault address. */
+#ifdef HUSK_OOP_IOS_DIAG
+const char *tl_bionic_name_of(const void *addr);
+#endif
+static void jni_report_stop(jni_gate *j,const jni_thread *t,const char *name,const char *why) {
+    static _Atomic unsigned reported;
+    if (!t || atomic_fetch_add(&reported,1)>=8) return;
+    void tl_log_line(const char *, ...);
+    const bb_state *s=&t->native_state; uint64_t base=j->lib?(uintptr_t)tl_ld_lib_base(j->lib):0, pc=s->pc, lr=s->x[30];
+    const char *host=NULL; uint32_t w=0; bool code=bb_read(j->engine,pc,&w,4);
+#ifdef HUSK_OOP_IOS_DIAG
+    if (!code) host=tl_bionic_name_of((void *)(uintptr_t)pc);
+#endif
+    char where[96], ret[64];
+    if (code && base && pc>=base && pc-base<(UINT64_C(1)<<28)) snprintf(where,sizeof(where),"game+%#llx word=%08x",(unsigned long long)(pc-base),w);
+    else if (code) snprintf(where,sizeof(where),"guest %#llx word=%08x",(unsigned long long)pc,w);
+    else snprintf(where,sizeof(where),"outside guest memory%s%s",host?", host import ":"",host?host:" (no bridged or named import)");
+    if (base && lr>=base && lr-base<(UINT64_C(1)<<28)) snprintf(ret,sizeof(ret),"game+%#llx",(unsigned long long)(lr-base)); else snprintf(ret,sizeof(ret),"%#llx",(unsigned long long)lr);
+    tl_log_line("oop: native %s stopped: %s gate=%d guest=%s pc=%#llx (%s) lr=%s sp=%#llx x0=%#llx x1=%#llx x2=%#llx fault_address=unavailable",
+                name,why,t->native_gate,bb_result_name(t->native_guest),(unsigned long long)pc,where,ret,(unsigned long long)s->sp,
+                (unsigned long long)s->x[0],(unsigned long long)s->x[1],(unsigned long long)s->x[2]);
+}
 static bool jni_foreign_fail(jni_gate *j,const jni_thread *t,const char *name,const char *why) {
+    if (t && t->native_gate!=OOP_GATE_OK && t->native_gate!=OOP_GATE_ARGUMENT) jni_report_stop(j,t,name,why);
     char msg[300];
     snprintf(msg,sizeof(msg),"out-of-place native %s: %s (gate=%d guest=%s)",name,why,t?t->native_gate:OOP_GATE_ARGUMENT,bb_result_name(t?t->native_guest:BB_INTERNAL));
     tl_jni_throw("java/lang/InternalError",msg); return false;
@@ -689,6 +738,7 @@ static bool jni_foreign_call(void *opaque,void *fn,const char *shorty,jobj *targ
     uint64_t sp=0;
     if (!oop_domain_reentry_stack(j->domain,&sp)) sp=t->stack?t->stack:j->stack;   /* not nested: the thread's own guest stack */
     uint32_t frame=++t->frame; uint64_t stk[64]; int ng=2,nf=0,ns=0; bool ok=false; const char *why="guest stopped";
+    bool after=false; unsigned after_calls=0, after_ok=0, after_failed=0;
     bb_state s={0}, entry={0}; s.tpidr_el0=t->tls; s.x[0]=t->env;
     void *(*local)(void *,void *)=(void *(*)(void *,void *))j->env_fns[25];
     if (!target || !jni_ref_put(j,t,local(env,target),false,&s.x[1])) { why="receiver"; goto out; }
@@ -732,8 +782,15 @@ out:
                    j->native_names[i].first_guest=t->native_guest; j->native_names[i].first_stop=t->native_state; j->native_names[i].first_entry=entry; }
                ++j->native_names[i].failed; j->native_names[i].gate=t->native_gate; j->native_names[i].guest=t->native_guest;
                j->native_names[i].stop=t->native_state; snprintf(j->native_names[i].why,sizeof(j->native_names[i].why),"%s",why); }
+        /* After a native's first stop, its later calls at 1, 2, 4, ... calls on (bounded):
+         * whether the guest still completes them, apart from the host frame loop. */
+        if (j->native_names[i].failed) { unsigned since=j->native_names[i].calls-j->native_names[i].first_call;
+            if (since && !(since&(since-1)) && since<=4096) { after=true; after_calls=j->native_names[i].calls;
+                after_ok=j->native_names[i].ok; after_failed=j->native_names[i].failed; } }
         break; }
     pthread_mutex_unlock(&j->lock);
+    if (after) { void tl_log_line(const char *, ...);
+        tl_log_line("oop: native %s since its first stop: %u calls, %u completed in the guest, %u stopped",name,after_calls,after_ok,after_failed); }
     return ok || jni_foreign_fail(j,t,name,why);
 }
 static bool jni_getenv_gate(const bb_state *s, uint64_t *result, void *opaque) {
@@ -806,18 +863,19 @@ static bool jni_gate_open(jni_gate *j, bb_engine *engine, oop_domain *domain, ui
         !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+228*4,jni_exceptioncheck_gate,j) ||
         !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+169*4,jni_getstringutfchars_gate,j) ||
         !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+170*4,jni_releasestringutfchars_gate,j)) return false;
-    /* V and A forms of Call[Static]<T>Method (float/double results return in
-     * v0); the C varargs form (slot+0) stays unregistered and fails closed. */
+    /* All three forms of Call[Static]<T>Method: C variadic (slot+0), V and A;
+     * float/double results return in v0. */
     if (!jni_register_ext(j)) return false;
-    static const struct { unsigned t; oop_host_callback v,a,sv,sa; } calls[]={
-        {0,jni_call_v_L,jni_call_a_L,jni_scall_v_L,jni_scall_a_L},{1,jni_call_v_Z,jni_call_a_Z,jni_scall_v_Z,jni_scall_a_Z},
-        {2,jni_call_v_B,jni_call_a_B,jni_scall_v_B,jni_scall_a_B},{3,jni_call_v_C,jni_call_a_C,jni_scall_v_C,jni_scall_a_C},
-        {4,jni_call_v_S,jni_call_a_S,jni_scall_v_S,jni_scall_a_S},{5,jni_call_v_I,jni_call_a_I,jni_scall_v_I,jni_scall_a_I},
-        {6,jni_call_v_J,jni_call_a_J,jni_scall_v_J,jni_scall_a_J},{7,jni_call_v_F,jni_call_a_F,jni_scall_v_F,jni_scall_a_F},
-        {8,jni_call_v_D,jni_call_a_D,jni_scall_v_D,jni_scall_a_D},{9,jni_call_v_V,jni_call_a_V,jni_scall_v_V,jni_scall_a_V}};
+#define JNI_CALLS(T,I) {I,jni_call_v_##T,jni_call_a_##T,jni_call_c_##T,jni_scall_v_##T,jni_scall_a_##T,jni_scall_c_##T}
+    static const struct { unsigned t; oop_host_callback v,a,c,sv,sa,sc; } calls[]={
+        JNI_CALLS(L,0),JNI_CALLS(Z,1),JNI_CALLS(B,2),JNI_CALLS(C,3),JNI_CALLS(S,4),
+        JNI_CALLS(I,5),JNI_CALLS(J,6),JNI_CALLS(F,7),JNI_CALLS(D,8),JNI_CALLS(V,9)};
+#undef JNI_CALLS
     for (size_t i=0;i<sizeof(calls)/sizeof(calls[0]);i++) {
         uint64_t inst=34+calls[i].t*3, stat=114+calls[i].t*3;
         if (!env_fns[inst+2] || !env_fns[stat+2] ||
+            !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+inst*4,calls[i].c,j) ||
+            !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+stat*4,calls[i].sc,j) ||
             !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+(inst+1)*4,calls[i].v,j) ||
             !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+(inst+2)*4,calls[i].a,j) ||
             !oop_domain_register_host(domain,JNI_ENV_TOKEN_BASE+(stat+1)*4,calls[i].sv,j) ||

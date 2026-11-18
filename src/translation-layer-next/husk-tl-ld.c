@@ -3311,6 +3311,30 @@ done_real:
     pthread_mutex_unlock(&g_big);
     return *stage==3;
 }
+
+/* One more private, dependency-free library of the out-of-place image, mapped and relocated the same way (never published, no
+ * constructors run here): what the guest later dlopens. `relocations` is its exact expected count. */
+bool tl_ld_oop_real_open_extra(const uint8_t *bytes, size_t n, const char *name, size_t relocations, tl_lib **out)
+{
+    if (!out) return false;
+    *out=NULL;
+    if (!name || !oop_real_elf_ok(bytes,n)) return false;
+    pthread_mutex_lock(&g_big);
+    tl_lib *L=NULL;
+    if (g_oop_mapping || g_aot.on || g_aot_dir || G.napks) goto done_extra;
+    g_oop_mapping=true; g_oop_real_mapping=true;
+    L=map_library(name,(uint8_t *)bytes,n);
+    g_oop_mapping=false; g_oop_real_mapping=false;
+    if (!L || !oop_real_deps(L,NULL,0)) goto done_extra;
+    L->deps_ready=true;
+    if (!relocate(L) || L->oop_relocations!=relocations) goto done_extra;
+    *out=L; L=NULL;
+done_extra:
+    g_oop_mapping=false; g_oop_real_mapping=false;
+    if (L) tl_ld_oop_fixture_close(L);
+    pthread_mutex_unlock(&g_big);
+    return *out!=NULL;
+}
 #endif
 
 /* Folders a library named only by its file name is also looked for in: the Java runtime's (the APEXes' lib64), and folders the app

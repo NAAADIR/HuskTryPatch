@@ -27,6 +27,10 @@ bb_engine *bb_attach(uint8_t *guest, uint8_t *write, size_t size, size_t slots,
  * execution are serialized by the caller. Clear removes all entries owned by
  * the given callback/opaque pair and must not race an active invocation. */
 bool bb_set_host_gate(bb_engine *e, uint64_t address, bb_host_gate gate, void *opaque);
+/* SVC #0 (a guest Linux system call) is served by `handler`, called with the
+ * engine lock released; it sets x0 and leaves the PC. Without one, SVC is
+ * BB_UNSUPPORTED. */
+bool bb_set_svc_handler(bb_engine *e, bool (*handler)(bb_state *, void *), void *opaque);
 bool bb_clear_host_gate(bb_engine *e, bb_host_gate gate, void *opaque);
 void bb_destroy(bb_engine *e);
 /* Turn on the engine execution lock, once, before any thread enters the guest.

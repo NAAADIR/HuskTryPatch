@@ -2,7 +2,10 @@
 #if defined(HUSK_OOP_IOS_DIAG) || defined(HUSK_OOP_DOMAIN_TEST)
 #include "husk-oop-imports.h"
 #include "husk-tl-ld.h"
+#include <arpa/inet.h>
 #include <pthread.h>
+#include <errno.h>
+#include <unistd.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -887,6 +890,39 @@ static uint64_t lf_dir_entry(uint64_t d) {
     pthread_mutex_lock(&lf_lock); uint64_t g=0; for (size_t i=0;i<lf_ndirs;i++) if (lf_dirs[i].dir==d) g=lf_dirs[i].entry; pthread_mutex_unlock(&lf_lock);
     return g;
 }
+/* Transport markers (diagnostics, bounded): names the guest resolves, its
+ * connects, and the first bytes each connected socket sends and receives.
+ * Counts and endpoints only; no payload is ever logged. */
+#define OX_FDS 32
+static pthread_mutex_t ox_lock=PTHREAD_MUTEX_INITIALIZER;
+static struct { int fd; bool used, sent, received; } ox[OX_FDS];
+static _Atomic unsigned ox_tracked, ox_dns, ox_conn;
+static void ox_connect(bb_engine *e, int fd, uint64_t sa, uint32_t len, long r) {
+    if (atomic_fetch_add(&ox_conn,1)>=24) return;
+    uint8_t a[28]={0}; char ip[64]="?"; unsigned port=0; uint16_t fam=0;
+    if (len>=2 && bb_read(e,sa,a,len<sizeof(a)?len:sizeof(a))) {
+        memcpy(&fam,a,2); port=(unsigned)a[2]<<8|a[3];
+        if (fam==2 && len>=8) inet_ntop(AF_INET,a+4,ip,sizeof(ip));
+        else if (fam==10 && len>=24) inet_ntop(AF_INET6,a+8,ip,sizeof(ip));
+    }
+    void tl_log_line(const char *, ...);
+    tl_log_line("oop: guest connect(fd %d, family %u, %s port %u) -> %ld",fd,fam,ip,port,r);
+    if (fam!=2 && fam!=10) return;
+    pthread_mutex_lock(&ox_lock);
+    int slot=-1; for (int i=0;i<OX_FDS;i++) { if (ox[i].used && ox[i].fd==fd) { slot=i; break; } if (!ox[i].used && slot<0) slot=i; }
+    if (slot>=0) { ox[slot].fd=fd; ox[slot].used=true; ox[slot].sent=ox[slot].received=false; atomic_store(&ox_tracked,1); }
+    pthread_mutex_unlock(&ox_lock);
+}
+static void ox_data(int fd, long n, bool in) {
+    if (n<=0 || !atomic_load(&ox_tracked)) return;
+    bool report=false;
+    pthread_mutex_lock(&ox_lock);
+    for (int i=0;i<OX_FDS;i++) if (ox[i].used && ox[i].fd==fd) {
+        bool *f=in?&ox[i].received:&ox[i].sent; if (!*f) { *f=true; report=true; } break; }
+    pthread_mutex_unlock(&ox_lock);
+    if (report) { void tl_log_line(const char *, ...); tl_log_line("oop: guest socket fd %d: first %ld bytes %s",fd,n,in?"received":"sent"); }
+}
+
 static bool imp_file(const bb_state *s, uint64_t *result, void *opaque) {
     oop_import *m=opaque; bb_engine *e=m->owner->engine; void *fn=m->fn; const uint64_t *x=s->x; size_t l1,l2; void *alias=NULL;
     uint64_t r=0;
@@ -948,10 +984,10 @@ static bool imp_file(const bb_state *s, uint64_t *result, void *opaque) {
     case LF_READ: case LF_READ_CHK: {  /* read(fd, buf, n[, buflen]) */
         if (x[2]>(UINT64_C(1)<<31) || (m->shape==LF_READ_CHK && x[2]>x[3])) return false;
         if (x[2] && !bb_host_data_alias(e,x[1],(size_t)x[2],&alias)) return false;
-        r=(uint64_t)((long (*)(int,void *,size_t))fn)((int)x[0],alias,(size_t)x[2]); break; }
+        r=(uint64_t)((long (*)(int,void *,size_t))fn)((int)x[0],alias,(size_t)x[2]); ox_data((int)x[0],(long)r,true); break; }
     case LF_WRITE:
         if (x[2]>(UINT64_C(1)<<31) || (x[2] && !bb_access(e,x[1],(size_t)x[2],BB_R))) return false;
-        r=(uint64_t)((long (*)(int,const void *,size_t))fn)((int)x[0],(const void *)(uintptr_t)x[1],(size_t)x[2]); break;
+        r=(uint64_t)((long (*)(int,const void *,size_t))fn)((int)x[0],(const void *)(uintptr_t)x[1],(size_t)x[2]); ox_data((int)x[0],(long)r,false); break;
     case LF_INT_FD:                    /* close(fd) */
         r=(uint32_t)((int (*)(int))fn)((int)x[0]); break;
     case LF_LSEEK:
@@ -1128,7 +1164,7 @@ static bool imp_runtime(const bb_state *s, uint64_t *result, void *opaque) {
         if (x[0] && n && !bb_host_data_alias(e,x[0],n,&out)) return false;
         if (x[0] && !n) out=(void *)(uintptr_t)x[0];   /* the shim does not write for an invalid code point */
         r=((size_t (*)(char *,wchar_t,void *))fn)(out,(wchar_t)wc,NULL); break; }
-    case LRT_SYNC: {                    /* pthread mutex/cond/rwlock/attr objects through Husk's shim, on the writable alias */
+    case LRT_SYNC: {                    /* pthread mutex/cond/rwlock/attr and semaphore objects through Husk's shim, on the writable alias */
         void *p[3]={0}; unsigned sz[3]={m->arg&255,(m->arg>>8)&255,(m->arg>>16)&255};
         for (int i=0;i<3;i++) {
             if (!sz[i]) { p[i]=(void *)(uintptr_t)x[i]; continue; }
@@ -1206,6 +1242,11 @@ int oop_imports_register_runtime(oop_imports *b) {
         {"pthread_rwlock_init",LRT_SYNC,RT_SYNC(56,8,0,RT_OPT1)},{"pthread_rwlock_destroy",LRT_SYNC,RT_SYNC(56,0,0,0)},
         {"pthread_rwlock_rdlock",LRT_SYNC,RT_SYNC(56,0,0,0)},{"pthread_rwlock_wrlock",LRT_SYNC,RT_SYNC(56,0,0,0)},
         {"pthread_rwlock_unlock",LRT_SYNC,RT_SYNC(56,0,0,0)},
+        /* bionic sem_t is 16 bytes on LP64; Husk's semaphore shim keeps its host object behind it, as in place. */
+        {"sem_init",LRT_SYNC,RT_SYNC(16,0,0,0)},{"sem_destroy",LRT_SYNC,RT_SYNC(16,0,0,0)},
+        {"sem_post",LRT_SYNC,RT_SYNC(16,0,0,0)},{"sem_wait",LRT_SYNC,RT_SYNC(16,0,0,0)},
+        {"sem_trywait",LRT_SYNC,RT_SYNC(16,0,0,0)},{"sem_timedwait",LRT_SYNC,RT_SYNC(16,16,0,0)},
+        {"sem_getvalue",LRT_SYNC,RT_SYNC(16,4,0,0)},
         {"strerror",LRT_STRERROR},{"strerror_r",LRT_STRERROR_R},
         {"getpid",LRT_INT},{"getuid",LRT_INT},{"geteuid",LRT_INT},{"getgid",LRT_INT},{"getegid",LRT_INT},{"sysconf",LRT_INT},
         {"getpriority",LRT_INT},{"setpriority",LRT_INT},{"alarm",LRT_INT},{"sched_yield",LRT_INT},{"usleep",LRT_INT},
@@ -1264,7 +1305,9 @@ static bool imp_net(const bb_state *s, uint64_t *result, void *opaque) {
         r=(uint32_t)((int (*)(int,int,int,void *))fn)((int)x[0],(int)x[1],(int)x[2],a); break;
     case LN_SOCKADDR_IN:                /* bind/connect(fd, const sockaddr *, len) */
         if ((uint32_t)x[2]>256 || (x[2] && !bb_access(e,x[1],(size_t)(uint32_t)x[2],BB_R))) return false;
-        r=(uint32_t)((int (*)(int,const void *,uint32_t))fn)((int)x[0],(const void *)(uintptr_t)x[1],(uint32_t)x[2]); break;
+        r=(uint32_t)((int (*)(int,const void *,uint32_t))fn)((int)x[0],(const void *)(uintptr_t)x[1],(uint32_t)x[2]);
+        if (!strcmp(m->name,"connect")) ox_connect(e,(int)x[0],x[1],(uint32_t)x[2],(long)(int32_t)r);
+        break;
     case LN_SOCKADDR_OUT:               /* accept/getsockname/getpeername(fd, sockaddr *, socklen_t *) */
         if (!ln_out(e,x[1],x[2],&a,&b,256)) return false;
         r=(uint32_t)((int (*)(int,void *,void *))fn)((int)x[0],a,b); break;
@@ -1276,20 +1319,20 @@ static bool imp_net(const bb_state *s, uint64_t *result, void *opaque) {
         r=(uint32_t)((int (*)(int,int,int,void *,void *))fn)((int)x[0],(int)x[1],(int)x[2],a,b); break;
     case LN_SEND:                       /* (fd, buf, n, flags) */
         if (x[2]>(UINT64_C(1)<<31) || (x[2] && !bb_access(e,x[1],(size_t)x[2],BB_R))) return false;
-        r=(uint64_t)((long (*)(int,const void *,size_t,int))fn)((int)x[0],(const void *)(uintptr_t)x[1],(size_t)x[2],(int)x[3]); break;
+        r=(uint64_t)((long (*)(int,const void *,size_t,int))fn)((int)x[0],(const void *)(uintptr_t)x[1],(size_t)x[2],(int)x[3]); ox_data((int)x[0],(long)r,false); break;
     case LN_RECV:
         if (x[2]>(UINT64_C(1)<<31) || (x[2] && !bb_host_data_alias(e,x[1],(size_t)x[2],&a))) return false;
-        r=(uint64_t)((long (*)(int,void *,size_t,int))fn)((int)x[0],a,(size_t)x[2],(int)x[3]); break;
+        r=(uint64_t)((long (*)(int,void *,size_t,int))fn)((int)x[0],a,(size_t)x[2],(int)x[3]); ox_data((int)x[0],(long)r,true); break;
     case LN_SENDTO: case LN_SENDTO_CHK: {   /* (fd, buf, n, [buflen,] flags, addr, alen) */
         int o=m->shape==LN_SENDTO_CHK; uint64_t n=x[2], flags=x[3+o], addr=x[4+o], alen=(uint32_t)x[5+o];
         if (o && n>x[3]) return false;
         if (n>(UINT64_C(1)<<31) || (n && !bb_access(e,x[1],(size_t)n,BB_R)) || alen>256 || (alen && !bb_access(e,addr,(size_t)alen,BB_R))) return false;
-        r=(uint64_t)((long (*)(int,const void *,size_t,int,const void *,uint32_t))tl_bionic_find("sendto"))((int)x[0],(const void *)(uintptr_t)x[1],(size_t)n,(int)flags,(const void *)(uintptr_t)addr,(uint32_t)alen);
+        r=(uint64_t)((long (*)(int,const void *,size_t,int,const void *,uint32_t))tl_bionic_find("sendto"))((int)x[0],(const void *)(uintptr_t)x[1],(size_t)n,(int)flags,(const void *)(uintptr_t)addr,(uint32_t)alen); ox_data((int)x[0],(long)r,false);
         break; }
     case LN_RECVFROM: {                 /* (fd, buf, n, flags, addr, socklen_t *) */
         void *c=NULL;
         if (x[2]>(UINT64_C(1)<<31) || (x[2] && !bb_host_data_alias(e,x[1],(size_t)x[2],&a)) || !ln_out(e,x[4],x[5],&b,&c,256)) return false;
-        r=(uint64_t)((long (*)(int,void *,size_t,int,void *,void *))fn)((int)x[0],a,(size_t)x[2],(int)x[3],b,c); break; }
+        r=(uint64_t)((long (*)(int,void *,size_t,int,void *,void *))fn)((int)x[0],a,(size_t)x[2],(int)x[3],b,c); ox_data((int)x[0],(long)r,true); break; }
     case LN_POLL:                       /* (struct pollfd *, nfds, timeout): 8-byte entries, same on both sides */
         if (x[1]>4096 || (x[1] && !bb_host_data_alias(e,x[0],(size_t)x[1]*8,&a))) return false;
         r=(uint32_t)((int (*)(void *,unsigned long,int))fn)(a,(unsigned long)x[1],(int)x[2]); break;
@@ -1332,6 +1375,8 @@ static bool imp_net(const bb_state *s, uint64_t *result, void *opaque) {
             if (!room) return false;
             memcpy(resa,&out_guest,8);
         }
+        if (atomic_fetch_add(&ox_dns,1)<24) { void tl_log_line(const char *, ...);
+            tl_log_line("oop: guest getaddrinfo(\"%.128s\", \"%.32s\") -> %d",x[0]?(const char *)(uintptr_t)x[0]:"(null)",x[1]?(const char *)(uintptr_t)x[1]:"(null)",rc); }
         r=(uint32_t)rc; break; }
     case LN_FREEADDRINFO: {             /* only a list this bridge made */
         bool known=false;
@@ -1398,6 +1443,90 @@ int oop_imports_register_net(oop_imports *b) {
     }
     return registered;
 }
+/* ===================================================== raw system calls
+ * Guest SVC #0 (libgcore.so issues its system calls directly). The calls the
+ * in-place backend's Linux layer (tl_linux_syscall) serves are served the same
+ * way here, with guest buffers bounds-checked and outputs written through the
+ * writable alias. process_vm_readv on the guest's own pid reads guest memory
+ * through the engine: the guest image as the guest sees it, under its logical
+ * permissions, never host memory. Any other system call stops the guest. */
+long tl_linux_syscall(long, long, long, long, long, long, long);
+static _Atomic unsigned sys_counts[512]; static _Atomic unsigned sys_refused[512];
+static bool sys_alias(bb_engine *e, uint64_t p, uint64_t n, void **out) { return !n || (n<(UINT64_C(1)<<31) && bb_host_data_alias(e,p,(size_t)n,out)); }
+static bool sys_in(bb_engine *e, uint64_t p, uint64_t n) { return !n || (n<(UINT64_C(1)<<31) && bb_access(e,p,(size_t)n,BB_R)); }
+static bool imp_syscall(const bb_state *s, long nr, int64_t *r, void *opaque) {
+    oop_imports *b=opaque; bb_engine *e=b->engine; const uint64_t *x=s->x; void *a=NULL,*c=NULL; size_t len;
+    unsigned slot=nr>=0 && nr<512?(unsigned)nr:511;
+    switch (nr) {
+    case 172: case 173: case 174: case 175: case 176: case 177: case 178: case 124: case 283:   /* ids, sched_yield, membarrier */
+        *r=tl_linux_syscall(0,0,0,0,0,0,nr); break;
+    case 113:   /* clock_gettime(clock, struct timespec *) */
+        if (!sys_alias(e,x[1],16,&a) || !a) return false;
+        *r=tl_linux_syscall((long)x[0],(long)a,0,0,0,0,nr); break;
+    case 169:   /* gettimeofday(tv, tz) */
+        if ((x[0] && !sys_alias(e,x[0],16,&a)) || (x[1] && !sys_alias(e,x[1],8,&c))) return false;
+        *r=tl_linux_syscall((long)a,(long)c,0,0,0,0,nr); break;
+    case 101:   /* nanosleep(req, rem) */
+        if (!sys_in(e,x[0],16) || (x[1] && !sys_alias(e,x[1],16,&c))) return false;
+        *r=tl_linux_syscall((long)x[0],(long)c,0,0,0,0,nr); break;
+    case 160:   /* uname: struct utsname is 6 x 65 bytes */
+        if (!sys_alias(e,x[0],390,&a) || !a) return false;
+        *r=tl_linux_syscall((long)a,0,0,0,0,0,nr); break;
+    case 278:   /* getrandom(buf, n, flags) */
+        if (x[1]>(1u<<20) || !sys_alias(e,x[0],x[1],&a)) return false;
+        *r=tl_linux_syscall((long)a,(long)x[1],(long)x[2],0,0,0,nr); break;
+    case 56: case 48:   /* openat / faccessat(dirfd, path, ...) */
+        if (!guest_strnlen(e,x[1],4096,&len)) return false;
+        *r=tl_linux_syscall((long)x[0],(long)x[1],(long)x[2],(long)x[3],0,0,nr); break;
+    case 57: case 62:   /* close, lseek */
+        *r=tl_linux_syscall((long)x[0],(long)x[1],(long)x[2],0,0,0,nr); break;
+    case 63:    /* read(fd, buf, n) */
+        if (!sys_alias(e,x[1],x[2],&a)) return false;
+        *r=tl_linux_syscall((long)x[0],(long)a,(long)x[2],0,0,0,nr); break;
+    case 64:    /* write(fd, buf, n) */
+        if (!sys_in(e,x[1],x[2])) return false;
+        *r=tl_linux_syscall((long)x[0],(long)x[1],(long)x[2],0,0,0,nr); break;
+    case 67: {  /* pread64(fd, buf, n, offset) */
+        if (!sys_alias(e,x[1],x[2],&a)) return false;
+        long n=pread((int)x[0],a,(size_t)x[2],(off_t)x[3]);
+        int tl_errno_to_guest(int); *r=n<0?-tl_errno_to_guest(errno):n; break; }
+    case 80:    /* fstat(fd, struct stat *): bionic's 128-byte layout */
+        if (!sys_alias(e,x[1],128,&a) || !a) return false;
+        *r=tl_linux_syscall((long)x[0],(long)a,0,0,0,0,nr); break;
+    case 79:    /* newfstatat(dirfd, path, struct stat *, flags) */
+        if (!guest_strnlen(e,x[1],4096,&len) || !sys_alias(e,x[2],128,&a) || !a) return false;
+        *r=tl_linux_syscall((long)x[0],(long)x[1],(long)a,(long)x[3],0,0,nr); break;
+    case 270: { /* process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags) on guest memory */
+        uint64_t liov=x[1], lcnt=x[2], riov=x[3], rcnt=x[4];
+        if (x[5]) { *r=-22; break; }
+        if ((long)x[0]!=(long)getpid()) { *r=-3; break; }   /* ESRCH: only the guest's own process */
+        if (lcnt>1024 || rcnt>1024 || !sys_in(e,liov,lcnt*16) || !sys_in(e,riov,rcnt*16)) { *r=-14; break; }
+        uint64_t li=0,loff=0,total=0; bool fault=false;
+        for (uint64_t ri=0;ri<rcnt && !fault;ri++) {
+            uint64_t rb,rl; bb_read(e,riov+ri*16,&rb,8); bb_read(e,riov+ri*16+8,&rl,8);
+            uint64_t done=0;
+            while (done<rl && li<lcnt) {
+                uint64_t lb,ll; bb_read(e,liov+li*16,&lb,8); bb_read(e,liov+li*16+8,&ll,8);
+                if (loff>=ll) { li++; loff=0; continue; }
+                uint64_t n=rl-done<ll-loff?rl-done:ll-loff; if (n>(1u<<20)) n=1u<<20;
+                void *dst; uint8_t tmp[4096]; uint64_t k=0;
+                if (!bb_host_data_alias(e,lb+loff,(size_t)n,&dst)) { fault=true; break; }
+                while (k<n) { size_t m=(size_t)(n-k<sizeof(tmp)?n-k:sizeof(tmp));
+                    if (!bb_read(e,rb+done+k,tmp,m)) { fault=true; break; } memcpy((uint8_t *)dst+k,tmp,m); k+=m; }
+                total+=k; done+=k; loff+=k;
+                if (fault) break;
+            }
+            if (done<rl) break;   /* local space exhausted */
+        }
+        *r=total?(int64_t)total:(fault?-14:0); break; }
+    default:
+        if (atomic_fetch_add(&sys_refused[slot],1)==0) { void tl_log_line(const char *, ...); tl_log_line("oop: guest system call %ld is not served out of place (x0=%#llx)",nr,(unsigned long long)x[0]); }
+        return false;
+    }
+    atomic_fetch_add(&sys_counts[slot],1); return true;
+}
+int oop_imports_register_syscalls(oop_imports *b) { return b && oop_domain_set_syscall(b->domain,imp_syscall,b)?1:-1; }
+unsigned oop_imports_syscall_count(long nr) { return nr>=0 && nr<512?atomic_load(&sys_counts[nr]):0; }
 int oop_imports_register_setjmp(oop_imports *b) {
     if (!b) return -1;
     uint64_t f[4]; const char *n[4]={"setjmp","sigsetjmp","longjmp","siglongjmp"}; int c=0;

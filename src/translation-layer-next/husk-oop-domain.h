@@ -19,6 +19,8 @@ bool oop_domain_enable_threads(oop_domain *domain);
 void oop_domain_destroy(oop_domain *domain);
 bool oop_domain_register_entry(oop_domain *domain, uint64_t guest_pc);
 bool oop_domain_register_host(oop_domain *domain, uint64_t token, oop_host_callback callback, void *opaque);
+/* Diagnostics: whether a host gate is registered at this token. */
+bool oop_domain_host_registered(oop_domain *domain, uint64_t token);
 /* State supplies all registers, 16-byte aligned writable guest SP and guest TLS.
  * x0-x7 are integer arguments. PC and LR are set by the gate; all final guest
  * state is returned, including on guest error. No implicit OS TLS is installed. */
@@ -33,6 +35,10 @@ bool oop_domain_reentry_stack(const oop_domain *domain, uint64_t *sp);
  * slots). Around every host callback the domain copies it into Husk's
  * per-host-thread guest errno and back. Set before enabling threads. */
 bool oop_domain_set_errno(oop_domain *domain, int *(*host_errno)(void), uint64_t tls_offset);
+/* Guest raw system calls (SVC #0): fn(state, number, &result, opaque); result
+ * is the Linux return value (or -errno); returning false stops the guest. */
+typedef bool (*oop_syscall_fn)(const bb_state *state, long number, int64_t *result, void *opaque);
+bool oop_domain_set_syscall(oop_domain *domain, oop_syscall_fn fn, void *opaque);
 /* qsort/bsearch with a guest comparator (nested guest calls). */
 bool oop_domain_register_sort(oop_domain *domain, uint64_t qsort_fn, uint64_t bsearch_fn);
 /* pthread_once with a guest init routine (bionic's int states 0/1/2 in guest memory). */

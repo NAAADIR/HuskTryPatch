@@ -37,6 +37,8 @@ void husk_oop_launch_get_status(husk_oop_launch_status *out);
 /* The bridge objects, for diagnostics (struct jni_gate / struct oop_imports). */
 #include <stdint.h>
 bool husk_oop_launch_views(const uint8_t **game, size_t *game_size, const uint8_t **cpp, size_t *cpp_size);
+/* Runner-only diagnostic: the game's dlopen/dlsym of libgcore.so and gcore_tick, via its PLT. */
+bool husk_oop_launch_selftest_dl(void);
 struct jni_gate *husk_oop_launch_jni(void);
 struct oop_imports *husk_oop_launch_imports(void);
 #endif

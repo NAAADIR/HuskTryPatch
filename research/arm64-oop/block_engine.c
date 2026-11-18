@@ -23,6 +23,7 @@ struct block { uint64_t pc; uint8_t count; bool valid, native, control, simd; };
 struct host_gate { uint64_t address; bb_host_gate gate; void *opaque; };
 struct heap_block { size_t off, size, reserved; struct heap_block *next; };
 struct bb_engine {
+    bool (*svc)(bb_state *, void *); void *svc_opaque;   /* SVC #0: a Linux system call, served by the embedder; NULL: unsupported */
     uint8_t *guest, *perms, *rw, *rx;
     uint8_t *guest_write;
     size_t size, map_size, npages, cache_size, slots, next;
@@ -113,6 +114,9 @@ bb_engine *bb_attach(uint8_t *guest, uint8_t *write, size_t size, size_t slots, 
     e->size=size; e->slots=slots; e->npages=(size+GPAGE-1)/GPAGE;
     e->perms=calloc(e->npages,1); if (!e->perms) { free(e); return NULL; }
     e->guest=guest; e->guest_write=write; e->rw=rw; e->rx=rx; e->cache_size=cache_size; e->borrowed=true; return e;
+}
+bool bb_set_svc_handler(bb_engine *e, bool (*handler)(bb_state *, void *), void *opaque) {
+    if (!e) return false; engine_lock(e); e->svc=handler; e->svc_opaque=opaque; engine_unlock(e); return true;
 }
 bool bb_enable_threads(bb_engine *e) {
     if (!e || e->threaded || e->poisoned) return false;
@@ -750,6 +754,15 @@ static bb_result step(bb_engine *e, bb_state *s, uint32_t w) {
     } else if ((w&0xffffffe0)==0x6f00e400 || (w&0xffffffe0)==0x2f00e400) {
         /* MOVI Vd.2D or Dd, #0. */
         s->v[rd][0]=s->v[rd][1]=0;
+    } else if (w==0xd4000001) {
+        /* SVC #0. Without a handler it stays unsupported. The handler runs with
+         * the engine lock released, as a host gate does, and must leave the PC. */
+        bool (*svc)(bb_state *, void *)=e->svc; void *op=e->svc_opaque;
+        if (!svc) return BB_UNSUPPORTED;
+        uint64_t at=s->pc;
+        engine_unlock(e); bool ok=svc(s,op); engine_lock(e);
+        if (!ok || s->pc!=at) return BB_UNSUPPORTED;
+        ++e->write_generation;
     } else if ((w&0xffffffe0)==0xd53bd040) { writereg(s,rd,false,true,s->tpidr_el0); }
     else if (w!=0xd503201f) return BB_UNSUPPORTED;
     s->pc=next; return BB_STOP;
